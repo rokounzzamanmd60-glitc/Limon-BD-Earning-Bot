@@ -1,1460 +1,312 @@
-import os
-import sqlite3
-import secrets
-import threading
+import os, sqlite3, secrets, asyncio
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
-from telegram import (
-    Update, ReplyKeyboardMarkup,
-    InlineKeyboardButton, InlineKeyboardMarkup
-)
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
-)
+DB='limon_bd.db'
+CONFIG='config.txt'
+STATE={}
 
-DB = "limon_bd.db"
-STATE = {}
-
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN = os.getenv("ADMIN_ID", "").strip()
-PASSWORD = os.getenv("ADMIN_PASSWORD", "12345").strip()
-
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing")
-
-if not ADMIN.isdigit():
-    raise RuntimeError("ADMIN_ID must be a number")
-
-ADMIN = int(ADMIN)
-
-
-def now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
+def now(): return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 def conn():
-    c = sqlite3.connect(DB)
-    c.row_factory = sqlite3.Row
-    return c
+    c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
 
+def setting(k,d=''):
+    c=conn(); r=c.execute('select value from settings where key=?',(k,)).fetchone(); c.close(); return r['value'] if r else d
 
-def setting(key, default=""):
-    c = conn()
-    r = c.execute(
-        "SELECT value FROM settings WHERE key=?",
-        (key,)
-    ).fetchone()
-    c.close()
-    return r["value"] if r else default
-
-
-def set_setting(key, value):
-    c = conn()
-    c.execute(
-        """INSERT INTO settings(key,value)
-        VALUES(?,?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
-        (key, str(value))
-    )
-    c.commit()
-    c.close()
-
+def set_setting(k,v):
+    c=conn(); c.execute('insert into settings(key,value) values(?,?) on conflict(key) do update set value=excluded.value',(k,str(v))); c.commit(); c.close()
 
 def init():
-    c = conn()
-    q = c.execute
+    c=conn(); q=c.execute
+    q('create table if not exists settings(key text primary key,value text)')
+    q('create table if not exists users(id integer primary key autoincrement,tg_id integer unique,name text,username text,balance real default 0,ref text unique,referred_by integer,ref_paid integer default 0,created_at text)')
+    q('create table if not exists tasks(id integer primary key autoincrement,title text,description text,reward real,link text,active integer default 1,created_at text)')
+    q('create table if not exists submissions(id integer primary key autoincrement,user_id integer,task_id integer,proof text,reward real,status text default "pending",created_at text,reviewed_at text)')
+    q('create table if not exists deposits(id integer primary key autoincrement,user_id integer,method text,amount real,trx text,status text default "pending",created_at text,reviewed_at text)')
+    q('create table if not exists withdrawals(id integer primary key autoincrement,user_id integer,method text,number text,amount real,status text default "pending",created_at text,reviewed_at text)')
+    q('create table if not exists notifications(id integer primary key autoincrement,user_id integer,message text,created_at text,is_read integer default 0)')
+    for k,v in {'bkash':'017XXXXXXXX','nagad':'019XXXXXXXX','ref_reward':'2','min_withdraw':'50'}.items(): q('insert or ignore into settings values(?,?)',(k,v))
+    c.commit(); c.close()
 
-    q("""CREATE TABLE IF NOT EXISTS settings(
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )""")
+def load_config():
+    # Render/Web Service uses Environment Variables instead of interactive input.
+    token=os.getenv('BOT_TOKEN','').strip()
+    aid=os.getenv('ADMIN_ID','').strip()
+    pwd=os.getenv('ADMIN_PASSWORD','12345').strip() or '12345'
+    if token and aid:
+        try:
+            return token, int(aid), pwd
+        except ValueError:
+            raise RuntimeError('ADMIN_ID must be a numeric Telegram user ID.')
 
-    q("""CREATE TABLE IF NOT EXISTS users(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        tg_id INTEGER UNIQUE,
-        name TEXT,
-        username TEXT,
-        balance REAL DEFAULT 0,
-        ref TEXT UNIQUE,
-        referred_by INTEGER,
-        created_at TEXT
-    )""")
+    # Optional local fallback: config.txt can still be used when running on a PC/mobile terminal.
+    if os.path.exists(CONFIG):
+        a=open(CONFIG,encoding='utf-8').read().splitlines()
+        if len(a) >= 2 and a[0].strip() and a[1].strip():
+            return a[0].strip(), int(a[1].strip()), (a[2].strip() if len(a) >= 3 and a[2].strip() else '12345')
 
-    q("""CREATE TABLE IF NOT EXISTS tasks(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT,
-        description TEXT,
-        reward REAL,
-        link TEXT,
-        active INTEGER DEFAULT 1,
-        created_at TEXT
-    )""")
+    raise RuntimeError('BOT_TOKEN and ADMIN_ID environment variables are required on Render.')
 
-    q("""CREATE TABLE IF NOT EXISTS submissions(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        task_id INTEGER,
-        proof TEXT,
-        reward REAL,
-        status TEXT DEFAULT 'pending',
-        created_at TEXT,
-        reviewed_at TEXT
-    )""")
+TOKEN,ADMIN,PASSWORD=load_config()
 
-    q("""CREATE TABLE IF NOT EXISTS deposits(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        method TEXT,
-        amount REAL,
-        trx TEXT,
-        status TEXT DEFAULT 'pending',
-        created_at TEXT,
-        reviewed_at TEXT
-    )""")
-
-    q("""CREATE TABLE IF NOT EXISTS withdrawals(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        method TEXT,
-        number TEXT,
-        amount REAL,
-        status TEXT DEFAULT 'pending',
-        created_at TEXT,
-        reviewed_at TEXT
-    )""")
-
-    q("""CREATE TABLE IF NOT EXISTS notifications(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        message TEXT,
-        created_at TEXT,
-        is_read INTEGER DEFAULT 0
-    )""")
-
-    defaults = {
-        "bkash": "017XXXXXXXX",
-        "nagad": "019XXXXXXXX",
-        "ref_reward": "2",
-        "min_withdraw": "50"
-    }
-
-    for k, v in defaults.items():
-        q(
-            "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
-            (k, v)
-        )
-
-    c.commit()
-    c.close()
-
-
-def get_user(tg):
-    c = conn()
-
-    r = c.execute(
-        "SELECT * FROM users WHERE tg_id=?",
-        (tg.id,)
-    ).fetchone()
-
+def user(tg):
+    c=conn(); r=c.execute('select * from users where tg_id=?',(tg.id,)).fetchone()
     if not r:
-        ref = secrets.token_hex(4).upper()
+        ref=secrets.token_hex(4).upper(); c.execute('insert into users(tg_id,name,username,ref,created_at) values(?,?,?,?,?)',(tg.id,tg.full_name,tg.username or '',ref,now())); c.commit(); r=c.execute('select * from users where tg_id=?',(tg.id,)).fetchone()
+    else: c.execute('update users set name=?,username=? where tg_id=?',(tg.full_name,tg.username or '',tg.id)); c.commit()
+    c.close(); return r
 
-        c.execute(
-            """INSERT INTO users
-            (tg_id,name,username,ref,created_at)
-            VALUES(?,?,?,?,?)""",
-            (
-                tg.id,
-                tg.full_name,
-                tg.username or "",
-                ref,
-                now()
-            )
-        )
+def menu(uid):
+    rows=[['🏠 Home','📋 Tasks'],['📤 Submit','💳 Deposit'],['💸 Withdraw','👥 Referral'],['📜 History','👤 Profile']]
+    if uid==ADMIN: rows.append(['🔐 Admin'])
+    return ReplyKeyboardMarkup(rows,resize_keyboard=True,is_persistent=True)
 
-        c.commit()
+def amenu(): return ReplyKeyboardMarkup([['➕ Add Task','📋 Manage Tasks'],['📥 Submissions','💳 Deposits'],['💸 Withdrawals','⚙️ Settings'],['👥 Users','🏠 Home']],resize_keyboard=True,is_persistent=True)
+def cancel_menu(): return ReplyKeyboardMarkup([['❌ Cancel']], resize_keyboard=True, is_persistent=True)
+def method_menu(): return ReplyKeyboardMarkup([['bKash','Nagad'],['❌ Cancel']], resize_keyboard=True, is_persistent=True)
+def clear(uid): STATE.pop(uid,None)
 
-        r = c.execute(
-            "SELECT * FROM users WHERE tg_id=?",
-            (tg.id,)
-        ).fetchone()
+async def start(u,ct):
+    x=u.effective_user; user(x)
+    if ct.args and ct.args[0].startswith('ref_'):
+        code=ct.args[0][4:]; c=conn(); me=c.execute('select * from users where tg_id=?',(x.id,)).fetchone(); rr=c.execute('select * from users where ref=?',(code,)).fetchone()
+        if rr and rr['tg_id']!=x.id and me['referred_by'] is None:
+            rew=float(setting('ref_reward','2')); c.execute('update users set referred_by=? where tg_id=?',(rr['tg_id'],x.id)); c.execute('update users set balance=balance+? where tg_id=?',(rew,rr['tg_id'])); c.execute('insert into notifications(user_id,message,created_at) values(?,?,?)',(rr['tg_id'],f'🎉 Referral Bonus +৳{rew:.2f}',now())); c.commit()
+        c.close()
+    clear(x.id); r=user(x)
+    await u.message.reply_text(f'🎉 *Limon BD Earning*\n\n👋 স্বাগতম {x.full_name}!\n\n💰 Balance: ৳{r["balance"]:.2f}\n📋 Unlimited Tasks\n\nMenu থেকে Option নির্বাচন করুন।',parse_mode='Markdown',reply_markup=menu(x.id))
 
-    else:
-        c.execute(
-            """UPDATE users
-            SET name=?, username=?
-            WHERE tg_id=?""",
-            (
-                tg.full_name,
-                tg.username or "",
-                tg.id
-            )
-        )
-        c.commit()
+async def home(u,ct): clear(u.effective_user.id); r=user(u.effective_user); await u.message.reply_text(f'🏠 *Home*\n\n💰 Balance: ৳{r["balance"]:.2f}',parse_mode='Markdown',reply_markup=menu(u.effective_user.id))
+async def profile(u,ct): clear(u.effective_user.id); r=user(u.effective_user); await u.message.reply_text(f'👤 *Profile*\n\n🆔 `{r["tg_id"]}`\n👤 {r["name"]}\n💰 ৳{r["balance"]:.2f}\n🎁 `{r["ref"]}`\n📅 {r["created_at"]}',parse_mode='Markdown',reply_markup=menu(u.effective_user.id))
+async def referral(u,ct):
+    clear(u.effective_user.id); r=user(u.effective_user); b=(await ct.bot.get_me()).username; c=conn(); n=c.execute('select count(*) c from users where referred_by=?',(r['tg_id'],)).fetchone()['c']; c.close(); link=f'https://t.me/{b}?start=ref_{r["ref"]}'; await u.message.reply_text(f'👥 *Referral*\n\n🎁 প্রতি Referral: ৳{float(setting("ref_reward","2")):.2f}\n👥 Total: {n}\n\n🔗 `{link}`',parse_mode='Markdown',reply_markup=menu(r['tg_id']))
 
-    c.close()
-    return r
-
-
-def user_menu(uid):
-    rows = [
-        ["🏠 Home", "📋 Tasks"],
-        ["📤 Submit", "💳 Deposit"],
-        ["💸 Withdraw", "👥 Referral"],
-        ["📜 History", "👤 Profile"]
-    ]
-
-    if uid == ADMIN:
-        rows.append(["🔐 Admin"])
-
-    return ReplyKeyboardMarkup(
-        rows,
-        resize_keyboard=True,
-        is_persistent=True
-    )
-
-
-def admin_menu():
-    return ReplyKeyboardMarkup(
-        [
-            ["➕ Add Task", "📋 Manage Tasks"],
-            ["📥 Submissions", "💳 Deposits"],
-            ["💸 Withdrawals", "⚙️ Settings"],
-            ["👥 Users", "🏠 Home"]
-        ],
-        resize_keyboard=True,
-        is_persistent=True
-    )
-
-
-def clear(uid):
-    STATE.pop(uid, None)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg = update.effective_user
-    get_user(tg)
-
-    if context.args:
-        arg = context.args[0]
-
-        if arg.startswith("ref_"):
-            code = arg[4:]
-            c = conn()
-
-            me = c.execute(
-                "SELECT * FROM users WHERE tg_id=?",
-                (tg.id,)
-            ).fetchone()
-
-            ref_user = c.execute(
-                "SELECT * FROM users WHERE ref=?",
-                (code,)
-            ).fetchone()
-
-            if (
-                ref_user
-                and ref_user["tg_id"] != tg.id
-                and me["referred_by"] is None
-            ):
-                reward = float(setting("ref_reward", "2"))
-
-                c.execute(
-                    "UPDATE users SET referred_by=? WHERE tg_id=?",
-                    (ref_user["tg_id"], tg.id)
-                )
-
-                c.execute(
-                    "UPDATE users SET balance=balance+? WHERE tg_id=?",
-                    (reward, ref_user["tg_id"])
-                )
-
-                c.execute(
-                    """INSERT INTO notifications
-                    (user_id,message,created_at)
-                    VALUES(?,?,?)""",
-                    (
-                        ref_user["tg_id"],
-                        f"🎉 Referral Bonus +৳{reward:.2f}",
-                        now()
-                    )
-                )
-
-                c.commit()
-
-            c.close()
-
-    clear(tg.id)
-    r = get_user(tg)
-
-    await update.message.reply_text(
-        f"""🎉 *Limon BD Earning*
-
-👋 স্বাগতম {tg.full_name}!
-
-💰 Balance: ৳{r["balance"]:.2f}
-📋 Unlimited Tasks
-
-Menu থেকে Option নির্বাচন করুন।""",
-        parse_mode="Markdown",
-        reply_markup=user_menu(tg.id)
-    )
-
-
-async def home(update, context):
-    uid = update.effective_user.id
-    clear(uid)
-    r = get_user(update.effective_user)
-
-    await update.message.reply_text(
-        f"🏠 *Home*\n\n💰 Balance: ৳{r['balance']:.2f}",
-        parse_mode="Markdown",
-        reply_markup=user_menu(uid)
-    )
-
-
-async def profile(update, context):
-    uid = update.effective_user.id
-    clear(uid)
-    r = get_user(update.effective_user)
-
-    await update.message.reply_text(
-        f"""👤 *Profile*
-
-🆔 `{r["tg_id"]}`
-👤 {r["name"]}
-💰 ৳{r["balance"]:.2f}
-🎁 `{r["ref"]}`
-📅 {r["created_at"]}""",
-        parse_mode="Markdown",
-        reply_markup=user_menu(uid)
-    )
-
-
-async def referral(update, context):
-    uid = update.effective_user.id
-    clear(uid)
-
-    r = get_user(update.effective_user)
-
-    bot = await context.bot.get_me()
-
-    c = conn()
-    count = c.execute(
-        "SELECT COUNT(*) AS c FROM users WHERE referred_by=?",
-        (uid,)
-    ).fetchone()["c"]
-    c.close()
-
-    link = f"https://t.me/{bot.username}?start=ref_{r['ref']}"
-
-    await update.message.reply_text(
-        f"""👥 *Referral*
-
-🎁 প্রতি Referral: ৳{float(setting("ref_reward","2")):.2f}
-👥 Total: {count}
-
-🔗 `{link}`""",
-        parse_mode="Markdown",
-        reply_markup=user_menu(uid)
-    )
-
-
-async def tasks(update, context):
-    uid = update.effective_user.id
-    clear(uid)
-
-    c = conn()
-
-    rows = c.execute(
-        "SELECT * FROM tasks WHERE active=1 ORDER BY id DESC"
-    ).fetchall()
-
-    c.close()
-
-    if not rows:
-        await update.message.reply_text(
-            "📋 এখন কোনো Task নেই।",
-            reply_markup=user_menu(uid)
-        )
-        return
-
-    await update.message.reply_text(
-        f"📋 মোট {len(rows)}টি Task আছে।"
-    )
-
+async def tasks(u,ct):
+    clear(u.effective_user.id); c=conn(); rows=c.execute('select * from tasks where active=1 order by id desc').fetchall(); c.close()
+    if not rows: await u.message.reply_text('📋 এখন কোনো Task নেই।',reply_markup=menu(u.effective_user.id)); return
+    await u.message.reply_text(f'📋 মোট {len(rows)}টি Task আছে।')
     for t in rows:
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "📤 Submit Proof",
-                    callback_data=f"sub:{t['id']}"
-                )
-            ]
-        ])
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton('📤 Submit Proof',callback_data=f'sub:{t["id"]}')]])
+        await u.message.reply_text(f'📌 *#{t["id"]} {t["title"]}*\n\n{t["description"]}\n\n💰 Reward: ৳{t["reward"]:.2f}\n🔗 {t["link"] or "নেই"}',parse_mode='Markdown',reply_markup=kb)
 
-        await update.message.reply_text(
-            f"""📌 *#{t["id"]} {t["title"]}*
-
-{t["description"]}
-
-💰 Reward: ৳{t["reward"]:.2f}
-🔗 {t["link"] or "নেই"}""",
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-
-
-async def add_task(update, context, state):
-    uid = update.effective_user.id
-    text = update.message.text
-    step = state["step"]
-    data = state["data"]
-
-    if step == 1:
-        data["title"] = text
-        state["step"] = 2
-        await update.message.reply_text(
-            "Task Description লিখুন:"
-        )
-
-    elif step == 2:
-        data["description"] = text
-        state["step"] = 3
-        await update.message.reply_text(
-            "Reward কত টাকা? শুধু সংখ্যা লিখুন:"
-        )
-
-    elif step == 3:
-        try:
-            data["reward"] = float(text)
-            state["step"] = 4
-
-            await update.message.reply_text(
-                "Task Link দিন। না থাকলে - লিখুন:"
-            )
-
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Reward শুধু সংখ্যা হবে। যেমন: 10"
-            )
-
+async def add_task_flow(u,ct,s):
+    uid=u.effective_user.id; text=u.message.text
+    step=s['step']; d=s['data']
+    if step==1: d['title']=text; s['step']=2; await u.message.reply_text('Task Description লিখুন:',reply_markup=cancel_menu())
+    elif step==2: d['description']=text; s['step']=3; await u.message.reply_text('Reward কত টাকা? শুধু সংখ্যা লিখুন:',reply_markup=cancel_menu())
+    elif step==3:
+        try: d['reward']=float(text); s['step']=4; await u.message.reply_text('Task Link দিন (না থাকলে - লিখুন):',reply_markup=cancel_menu())
+        except: await u.message.reply_text('❌ Reward শুধু সংখ্যা হবে। যেমন 10')
     else:
-        data["link"] = "" if text == "-" else text
+        d['link']='' if text=='-' else text; c=conn(); c.execute('insert into tasks(title,description,reward,link,created_at) values(?,?,?,?,?)',(d['title'],d['description'],d['reward'],d['link'],now())); c.commit(); c.close(); clear(uid); await u.message.reply_text('✅ Task Added!',reply_markup=amenu())
 
-        c = conn()
+async def submit_flow(u,ct,s):
+    uid=u.effective_user.id; tid=s['task']; proof=u.message.text
+    c=conn(); t=c.execute('select * from tasks where id=? and active=1',(tid,)).fetchone();
+    if not t: c.close(); clear(uid); await u.message.reply_text('❌ Task পাওয়া যায়নি.'); return
+    old=c.execute('select id from submissions where user_id=? and task_id=? and status="pending"',(uid,tid)).fetchone()
+    if old: c.close(); clear(uid); await u.message.reply_text('⏳ এই Task-এর একটি submission already pending.'); return
+    c.execute('insert into submissions(user_id,task_id,proof,reward,created_at) values(?,?,?,?,?)',(uid,tid,proof,t['reward'],now())); sid=c.lastrowid; c.commit(); c.close(); clear(uid)
+    kb=InlineKeyboardMarkup([[InlineKeyboardButton('✅ Approve',callback_data=f'sa:{sid}'),InlineKeyboardButton('❌ Reject',callback_data=f'sr:{sid}')]])
+    await ct.bot.send_message(ADMIN,f'📥 *New Task Submission*\n\n🆔 Submission: {sid}\n👤 User: {uid}\n📌 Task: #{tid} {t["title"]}\n💰 Reward: ৳{t["reward"]:.2f}\n\n📝 Proof:\n{proof}',parse_mode='Markdown',reply_markup=kb)
+    await u.message.reply_text('✅ Proof Admin-এর কাছে পাঠানো হয়েছে। Approval-এর জন্য অপেক্ষা করুন।',reply_markup=menu(uid))
 
-        c.execute(
-            """INSERT INTO tasks
-            (title,description,reward,link,created_at)
-            VALUES(?,?,?,?,?)""",
-            (
-                data["title"],
-                data["description"],
-                data["reward"],
-                data["link"],
-                now()
-            )
-        )
-
-        c.commit()
-        c.close()
-
-        clear(uid)
-
-        await update.message.reply_text(
-            "✅ Task Added!",
-            reply_markup=admin_menu()
-        )
-
-
-async def submit(update, context, state):
-    uid = update.effective_user.id
-    proof = update.message.text
-    task_id = state["task"]
-
-    c = conn()
-
-    task = c.execute(
-        "SELECT * FROM tasks WHERE id=? AND active=1",
-        (task_id,)
-    ).fetchone()
-
-    if not task:
-        c.close()
-        clear(uid)
-        await update.message.reply_text("❌ Task পাওয়া যায়নি।")
-        return
-
-    pending = c.execute(
-        """SELECT id FROM submissions
-        WHERE user_id=? AND task_id=? AND status='pending'""",
-        (uid, task_id)
-    ).fetchone()
-
-    if pending:
-        c.close()
-        clear(uid)
-        await update.message.reply_text(
-            "⏳ এই Task-এর submission already pending।"
-        )
-        return
-
-    c.execute(
-        """INSERT INTO submissions
-        (user_id,task_id,proof,reward,created_at)
-        VALUES(?,?,?,?,?)""",
-        (
-            uid,
-            task_id,
-            proof,
-            task["reward"],
-            now()
-        )
-    )
-
-    sid = c.lastrowid
-    c.commit()
-    c.close()
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "✅ Approve",
-                callback_data=f"sa:{sid}"
-            ),
-            InlineKeyboardButton(
-                "❌ Reject",
-                callback_data=f"sr:{sid}"
-            )
-        ]
-    ])
-
-    await context.bot.send_message(
-        ADMIN,
-        f"""📥 *New Task Submission*
-
-🆔 Submission: {sid}
-👤 User: {uid}
-📌 Task: #{task_id} {task["title"]}
-💰 Reward: ৳{task["reward"]:.2f}
-
-📝 Proof:
-{proof}""",
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
-
-    clear(uid)
-
-    await update.message.reply_text(
-        "✅ Proof Admin-এর কাছে পাঠানো হয়েছে। Approval-এর জন্য অপেক্ষা করুন।",
-        reply_markup=user_menu(uid)
-    )
-
-
-async def deposit(update, context, state):
-    uid = update.effective_user.id
-    text = update.message.text
-    step = state["step"]
-    data = state["data"]
-
-    if step == 1:
-        if text not in ("bKash", "Nagad"):
-            await update.message.reply_text(
-                "bKash অথবা Nagad লিখুন।"
-            )
-            return
-
-        data["method"] = text
-        state["step"] = 2
-
-        number = setting(text.lower(), "")
-
-        await update.message.reply_text(
-            f"💳 {text} Number: {number}\n\nকত টাকা Deposit করবেন?"
-        )
-
-    elif step == 2:
+async def deposit_flow(u,ct,s):
+    uid=u.effective_user.id; text=u.message.text.strip(); step=s['step']; d=s['data']
+    if step==1:
+        if text not in ('bKash','Nagad'):
+            await u.message.reply_text('নিচের bKash অথবা Nagad বাটনে চাপুন।',reply_markup=method_menu()); return
+        d['method']=text; s['step']=2
+        num=setting(text.lower(),'')
+        await u.message.reply_text(f'💳 {text} Number: {num}\n\nকত টাকা Deposit করবেন?',reply_markup=cancel_menu())
+    elif step==2:
         try:
-            amount = float(text)
-
-            if amount <= 0:
-                raise ValueError
-
-            data["amount"] = amount
-            state["step"] = 3
-
-            await update.message.reply_text(
-                "Transaction ID (TrxID) লিখুন:"
-            )
-
+            amount=float(text)
+            if amount<=0: raise ValueError
+            d['amount']=amount; s['step']=3
+            await u.message.reply_text('Transaction ID (TrxID) লিখুন:',reply_markup=cancel_menu())
         except ValueError:
-            await update.message.reply_text(
-                "❌ সঠিক Amount দিন।"
-            )
-
+            await u.message.reply_text('❌ সঠিক Amount দিন।',reply_markup=cancel_menu())
     else:
-        data["trx"] = text
+        d['trx']=text; c=conn(); c.execute('insert into deposits(user_id,method,amount,trx,created_at) values(?,?,?,?,?)',(uid,d['method'],d['amount'],d['trx'],now())); did=c.lastrowid; c.commit(); c.close(); clear(uid)
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton('✅ Approve',callback_data=f'da:{did}'),InlineKeyboardButton('❌ Reject',callback_data=f'dr:{did}')]])
+        await ct.bot.send_message(ADMIN,f'💳 *New Deposit*\n\nID: {did}\nUser: {uid}\nMethod: {d["method"]}\nAmount: ৳{d["amount"]:.2f}\nTrxID: `{d["trx"]}`',parse_mode='Markdown',reply_markup=kb)
+        await u.message.reply_text('✅ Deposit request পাঠানো হয়েছে।',reply_markup=menu(uid))
 
-        c = conn()
-
-        c.execute(
-            """INSERT INTO deposits
-            (user_id,method,amount,trx,created_at)
-            VALUES(?,?,?,?,?)""",
-            (
-                uid,
-                data["method"],
-                data["amount"],
-                data["trx"],
-                now()
-            )
-        )
-
-        did = c.lastrowid
-        c.commit()
-        c.close()
-
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "✅ Approve",
-                    callback_data=f"da:{did}"
-                ),
-                InlineKeyboardButton(
-                    "❌ Reject",
-                    callback_data=f"dr:{did}"
-                )
-            ]
-        ])
-
-        await context.bot.send_message(
-            ADMIN,
-            f"""💳 *New Deposit*
-
-ID: {did}
-User: {uid}
-Method: {data["method"]}
-Amount: ৳{data["amount"]:.2f}
-TrxID: `{data["trx"]}`""",
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-
-        clear(uid)
-
-        await update.message.reply_text(
-            "✅ Deposit request পাঠানো হয়েছে।",
-            reply_markup=user_menu(uid)
-        )
-
-
-async def withdraw(update, context, state):
-    uid = update.effective_user.id
-    text = update.message.text
-    step = state["step"]
-    data = state["data"]
-
-    if step == 1:
-        if text not in ("bKash", "Nagad"):
-            await update.message.reply_text(
-                "bKash অথবা Nagad লিখুন।"
-            )
-            return
-
-        data["method"] = text
-        state["step"] = 2
-
-        await update.message.reply_text(
-            f"{text} Number লিখুন:"
-        )
-
-    elif step == 2:
-        data["number"] = text
-        state["step"] = 3
-
-        await update.message.reply_text(
-            f"Minimum Withdraw: ৳{setting('min_withdraw','50')}\n\nAmount লিখুন:"
-        )
-
+async def withdraw_flow(u,ct,s):
+    uid=u.effective_user.id; text=u.message.text.strip(); step=s['step']; d=s['data']
+    if step==1:
+        if text not in ('bKash','Nagad'):
+            await u.message.reply_text('নিচের bKash অথবা Nagad বাটনে চাপুন।',reply_markup=method_menu()); return
+        d['method']=text; s['step']=2
+        await u.message.reply_text(f'{text} Number লিখুন:',reply_markup=cancel_menu())
+    elif step==2:
+        d['number']=text; s['step']=3
+        await u.message.reply_text(f'Minimum Withdraw: ৳{setting("min_withdraw","50")}\n\nAmount লিখুন:',reply_markup=cancel_menu())
     else:
         try:
-            amount = float(text)
-            minimum = float(setting("min_withdraw", "50"))
-
-            if amount < minimum:
-                await update.message.reply_text(
-                    f"❌ Minimum Withdraw ৳{minimum:.2f}"
-                )
-                return
-
+            amount=float(text); minimum=float(setting('min_withdraw','50'))
+            if amount<minimum: await u.message.reply_text(f'❌ Minimum Withdraw ৳{minimum:.2f}',reply_markup=cancel_menu()); return
+            if amount<=0: raise ValueError
         except ValueError:
-            await update.message.reply_text(
-                "❌ সঠিক Amount দিন।"
-            )
-            return
+            await u.message.reply_text('❌ সঠিক Amount দিন।',reply_markup=cancel_menu()); return
+        c=conn(); r=c.execute('select balance from users where tg_id=?',(uid,)).fetchone()
+        if not r or r['balance']<amount: c.close(); await u.message.reply_text('❌ আপনার Balance যথেষ্ট নয়।',reply_markup=cancel_menu()); return
+        c.execute('update users set balance=balance-? where tg_id=?',(amount,uid))
+        c.execute('insert into withdrawals(user_id,method,number,amount,created_at) values(?,?,?,?,?)',(uid,d['method'],d['number'],amount,now())); wid=c.lastrowid; c.commit(); c.close(); clear(uid)
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton('✅ Approve',callback_data=f'wa:{wid}'),InlineKeyboardButton('❌ Reject',callback_data=f'wr:{wid}')]])
+        await ct.bot.send_message(ADMIN,f'💸 *New Withdrawal*\n\nID: {wid}\nUser: {uid}\nMethod: {d["method"]}\nNumber: {d["number"]}\nAmount: ৳{amount:.2f}',parse_mode='Markdown',reply_markup=kb)
+        await u.message.reply_text('✅ Withdrawal request পাঠানো হয়েছে। Balance থেকে টাকা reserve করা হয়েছে।',reply_markup=menu(uid))
 
-        c = conn()
+async def history(u,ct):
+    uid=u.effective_user.id; clear(uid); c=conn(); a=c.execute('select * from submissions where user_id=? order by id desc limit 10',(uid,)).fetchall(); d=c.execute('select * from deposits where user_id=? order by id desc limit 10',(uid,)).fetchall(); w=c.execute('select * from withdrawals where user_id=? order by id desc limit 10',(uid,)).fetchall(); c.close(); out='📜 *History*\n\n📋 Submissions:\n'+('\n'.join(f'#{x["id"]} Task#{x["task_id"]} — {x["status"]} — ৳{x["reward"]:.2f}' for x in a) or 'None')+'\n\n💳 Deposits:\n'+('\n'.join(f'#{x["id"]} {x["method"]} ৳{x["amount"]:.2f} — {x["status"]}' for x in d) or 'None')+'\n\n💸 Withdrawals:\n'+('\n'.join(f'#{x["id"]} {x["method"]} ৳{x["amount"]:.2f} — {x["status"]}' for x in w) or 'None'); await u.message.reply_text(out,parse_mode='Markdown',reply_markup=menu(uid))
 
-        r = c.execute(
-            "SELECT balance FROM users WHERE tg_id=?",
-            (uid,)
-        ).fetchone()
+async def admin_menu(u,ct):
+    if u.effective_user.id!=ADMIN: await u.message.reply_text('❌ Access Denied'); return
+    clear(ADMIN); STATE[ADMIN]={'flow':'adminpass'}; await u.message.reply_text('🔐 Admin Password লিখুন:')
 
-        if not r or r["balance"] < amount:
-            c.close()
-
-            await update.message.reply_text(
-                "❌ আপনার Balance যথেষ্ট নয়।"
-            )
-            return
-
-        c.execute(
-            "UPDATE users SET balance=balance-? WHERE tg_id=?",
-            (amount, uid)
-        )
-
-        c.execute(
-            """INSERT INTO withdrawals
-            (user_id,method,number,amount,created_at)
-            VALUES(?,?,?,?,?)""",
-            (
-                uid,
-                data["method"],
-                data["number"],
-                amount,
-                now()
-            )
-        )
-
-        wid = c.lastrowid
-        c.commit()
-        c.close()
-
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "✅ Approve",
-                    callback_data=f"wa:{wid}"
-                ),
-                InlineKeyboardButton(
-                    "❌ Reject",
-                    callback_data=f"wr:{wid}"
-                )
-            ]
-        ])
-
-        await context.bot.send_message(
-            ADMIN,
-            f"""💸 *New Withdrawal*
-
-ID: {wid}
-User: {uid}
-Method: {data["method"]}
-Number: {data["number"]}
-Amount: ৳{amount:.2f}""",
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-
-        clear(uid)
-
-        await update.message.reply_text(
-            "✅ Withdrawal request পাঠানো হয়েছে।",
-            reply_markup=user_menu(uid)
-        )
-
-
-async def history(update, context):
-    uid = update.effective_user.id
-    clear(uid)
-
-    c = conn()
-
-    submissions = c.execute(
-        """SELECT * FROM submissions
-        WHERE user_id=? ORDER BY id DESC LIMIT 10""",
-        (uid,)
-    ).fetchall()
-
-    deposits = c.execute(
-        """SELECT * FROM deposits
-        WHERE user_id=? ORDER BY id DESC LIMIT 10""",
-        (uid,)
-    ).fetchall()
-
-    withdrawals = c.execute(
-        """SELECT * FROM withdrawals
-        WHERE user_id=? ORDER BY id DESC LIMIT 10""",
-        (uid,)
-    ).fetchall()
-
-    c.close()
-
-    out = "📜 *History*\n\n"
-
-    out += "📋 Submissions:\n"
-
-    if submissions:
-        for x in submissions:
-            out += (
-                f"#{x['id']} Task#{x['task_id']} — "
-                f"{x['status']} — ৳{x['reward']:.2f}\n"
-            )
-    else:
-        out += "None\n"
-
-    out += "\n💳 Deposits:\n"
-
-    if deposits:
-        for x in deposits:
-            out += (
-                f"#{x['id']} {x['method']} "
-                f"৳{x['amount']:.2f} — {x['status']}\n"
-            )
-    else:
-        out += "None\n"
-
-    out += "\n💸 Withdrawals:\n"
-
-    if withdrawals:
-        for x in withdrawals:
-            out += (
-                f"#{x['id']} {x['method']} "
-                f"৳{x['amount']:.2f} — {x['status']}\n"
-            )
-    else:
-        out += "None"
-
-    await update.message.reply_text(
-        out,
-        parse_mode="Markdown",
-        reply_markup=user_menu(uid)
-    )
-
-
-async def admin_login(update, context):
-    uid = update.effective_user.id
-
-    if uid != ADMIN:
-        await update.message.reply_text(
-            "❌ Access Denied"
-        )
-        return
-
-    STATE[uid] = {
-        "flow": "adminpass"
-    }
-
-    await update.message.reply_text(
-        "🔐 Admin Password লিখুন:"
-    )
-
-
-async def manage_tasks(update, context):
-    c = conn()
-
-    rows = c.execute(
-        "SELECT * FROM tasks ORDER BY id DESC"
-    ).fetchall()
-
-    c.close()
-
-    if not rows:
-        await update.message.reply_text(
-            "📋 কোনো Task নেই।",
-            reply_markup=admin_menu()
-        )
-        return
-
+async def admin_manage(u,ct):
+    c=conn(); rows=c.execute('select * from tasks order by id desc').fetchall(); c.close();
+    if not rows: await u.message.reply_text('📋 কোনো Task নেই।',reply_markup=amenu()); return
     for t in rows:
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "🗑 Delete",
-                    callback_data=f"tdel:{t['id']}"
-                )
-            ]
-        ])
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton('🗑 Delete',callback_data=f'tdel:{t["id"]}')]])
+        await u.message.reply_text(f'#{t["id"]} {t["title"]}\n💰 ৳{t["reward"]:.2f}\n🔗 {t["link"] or "-"}',reply_markup=kb)
 
-        await update.message.reply_text(
-            f"""#{t["id"]} {t["title"]}
-💰 ৳{t["reward"]:.2f}
-🔗 {t["link"] or "-"}""",
-            reply_markup=keyboard
-        )
-
-
-async def admin_list(update, context, kind):
-    tables = {
-        "sub": "submissions",
-        "dep": "deposits",
-        "with": "withdrawals"
-    }
-
-    table = tables[kind]
-
-    c = conn()
-
-    rows = c.execute(
-        f"""SELECT * FROM {table}
-        WHERE status='pending'
-        ORDER BY id DESC LIMIT 30"""
-    ).fetchall()
-
-    c.close()
-
-    if not rows:
-        await update.message.reply_text(
-            "✅ কোনো Pending request নেই।",
-            reply_markup=admin_menu()
-        )
-        return
-
+async def admin_list(u,ct,kind):
+    table={'sub':'submissions','dep':'deposits','with':'withdrawals'}[kind]; c=conn(); rows=c.execute(f'select * from {table} where status="pending" order by id desc limit 30').fetchall(); c.close()
+    if not rows: await u.message.reply_text('✅ কোনো Pending request নেই।',reply_markup=amenu()); return
     for r in rows:
+        if kind=='sub':
+            txt=f'📥 Submission #{r["id"]}\nUser: {r["user_id"]}\nTask: #{r["task_id"]}\nReward: ৳{r["reward"]}\nProof: {r["proof"]}'; cb=f'sa:{r["id"]}'; rb=f'sr:{r["id"]}'
+        elif kind=='dep': txt=f'💳 Deposit #{r["id"]}\nUser: {r["user_id"]}\n{r["method"]}\n৳{r["amount"]}\nTrx: {r["trx"]}'; cb=f'da:{r["id"]}'; rb=f'dr:{r["id"]}'
+        else: txt=f'💸 Withdrawal #{r["id"]}\nUser: {r["user_id"]}\n{r["method"]}\n{r["number"]}\n৳{r["amount"]}'; cb=f'wa:{r["id"]}'; rb=f'wr:{r["id"]}'
+        await u.message.reply_text(txt,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('✅ Approve',callback_data=cb),InlineKeyboardButton('❌ Reject',callback_data=rb)]]))
 
-        if kind == "sub":
-            text = (
-                f"📥 Submission #{r['id']}\n"
-                f"User: {r['user_id']}\n"
-                f"Task: #{r['task_id']}\n"
-                f"Reward: ৳{r['reward']}\n"
-                f"Proof: {r['proof']}"
-            )
-
-            approve = f"sa:{r['id']}"
-            reject = f"sr:{r['id']}"
-
-        elif kind == "dep":
-            text = (
-                f"💳 Deposit #{r['id']}\n"
-                f"User: {r['user_id']}\n"
-                f"{r['method']}\n"
-                f"৳{r['amount']}\n"
-                f"Trx: {r['trx']}"
-            )
-
-            approve = f"da:{r['id']}"
-            reject = f"dr:{r['id']}"
-
-        else:
-            text = (
-                f"💸 Withdrawal #{r['id']}\n"
-                f"User: {r['user_id']}\n"
-                f"{r['method']}\n"
-                f"{r['number']}\n"
-                f"৳{r['amount']}"
-            )
-
-            approve = f"wa:{r['id']}"
-            reject = f"wr:{r['id']}"
-
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "✅ Approve",
-                    callback_data=approve
-                ),
-                InlineKeyboardButton(
-                    "❌ Reject",
-                    callback_data=reject
-                )
-            ]
-        ])
-
-        await update.message.reply_text(
-            text,
-            reply_markup=keyboard
-        )
-
-
-async def settings(update, context):
-    STATE[ADMIN] = {
-        "flow": "settings",
-        "step": 1
-    }
-
-    await update.message.reply_text(
-        f"""⚙️ Settings
-
-1. bKash: {setting("bkash")}
-2. Nagad: {setting("nagad")}
-3. Referral: ৳{setting("ref_reward")}
-4. Minimum Withdraw: ৳{setting("min_withdraw")}
-
-কোনটি বদলাবেন? 1/2/3/4"""
-    )
-
-
-async def settings_flow(update, context, state):
-    text = update.message.text
-
-    if state["step"] == 1:
-
-        if text not in ("1", "2", "3", "4"):
-            await update.message.reply_text(
-                "1/2/3/4 লিখুন।"
-            )
+async def admin_settings(u,ct):
+    STATE[ADMIN]={'flow':'settings','step':1}
+    kb=ReplyKeyboardMarkup([['💳 bKash','💳 Nagad'],['🎁 Referral','💸 Min Withdraw'],['❌ Cancel']],resize_keyboard=True,is_persistent=True)
+    await u.message.reply_text(f'⚙️ Settings\n\nbKash: {setting("bkash")}\nNagad: {setting("nagad")}\nReferral: ৳{setting("ref_reward")}\nMinimum Withdraw: ৳{setting("min_withdraw") }\n\nযেটা পরিবর্তন করবেন সেটার বাটনে চাপুন।',reply_markup=kb)
+async def settings_flow(u,ct,s):
+    if s['step']==1:
+        keymap={'💳 bKash':'bkash','💳 Nagad':'nagad','🎁 Referral':'ref_reward','💸 Min Withdraw':'min_withdraw'}
+        key=keymap.get(u.message.text)
+        if not key:
+            await u.message.reply_text('নিচের একটি Settings বাটনে চাপুন।')
             return
-
-        state["key"] = {
-            "1": "bkash",
-            "2": "nagad",
-            "3": "ref_reward",
-            "4": "min_withdraw"
-        }[text]
-
-        state["step"] = 2
-
-        await update.message.reply_text(
-            "নতুন Value লিখুন:"
-        )
-
+        s['key']=key; s['step']=2; await u.message.reply_text('নতুন Value লিখুন:',reply_markup=cancel_menu())
     else:
-        set_setting(
-            state["key"],
-            text
-        )
+        set_setting(s['key'],u.message.text); clear(ADMIN); await u.message.reply_text('✅ Setting Updated.',reply_markup=amenu())
 
-        clear(ADMIN)
+async def admin_users(u,ct):
+    c=conn(); n=c.execute('select count(*) c from users').fetchone()['c']; rows=c.execute('select tg_id,name,balance from users order by id desc limit 20').fetchall(); c.close(); txt=f'👥 Total Users: {n}\n\n'+'\n'.join(f'{r["tg_id"]} | {r["name"]} | ৳{r["balance"]:.2f}' for r in rows); await u.message.reply_text(txt,reply_markup=amenu())
 
-        await update.message.reply_text(
-            "✅ Setting Updated.",
-            reply_markup=admin_menu()
-        )
-
-
-async def users(update, context):
-    c = conn()
-
-    total = c.execute(
-        "SELECT COUNT(*) AS c FROM users"
-    ).fetchone()["c"]
-
-    rows = c.execute(
-        """SELECT tg_id,name,balance
-        FROM users ORDER BY id DESC LIMIT 20"""
-    ).fetchall()
-
-    c.close()
-
-    text = f"👥 Total Users: {total}\n\n"
-
-    for r in rows:
-        text += (
-            f"{r['tg_id']} | "
-            f"{r['name']} | "
-            f"৳{r['balance']:.2f}\n"
-        )
-
-    await update.message.reply_text(
-        text,
-        reply_markup=admin_menu()
-    )
-
-
-async def callback(update, context):
-    query = update.callback_query
-
-    await query.answer()
-
-    uid = query.from_user.id
-    data = query.data
-
-    if data.startswith("sub:"):
-        task_id = int(data.split(":")[1])
-
-        STATE[uid] = {
-            "flow": "submit",
-            "task": task_id
-        }
-
-        await query.message.reply_text(
-            "📤 Proof পাঠান।"
-        )
-        return
-
-    if uid != ADMIN:
-        return
-
-    action, value = data.split(":")
-    rid = int(value)
-
-    c = conn()
-
+async def callback(u,ct):
+    q=u.callback_query; await q.answer(); uid=q.from_user.id; data=q.data
+    if data.startswith('sub:'):
+        tid=int(data.split(':')[1]); STATE[uid]={'flow':'submit','task':tid}; await q.message.reply_text('📤 Proof পাঠান (Screenshot নয় হলে Link/লিখিত Proof দিন):',reply_markup=cancel_menu()); return
+    if uid!=ADMIN: return
+    action,id_=data.split(':'); rid=int(id_); c=conn()
     try:
-        c.execute("BEGIN IMMEDIATE")
-
-        if action in ("sa", "sr"):
-
-            r = c.execute(
-                """SELECT * FROM submissions
-                WHERE id=? AND status='pending'""",
-                (rid,)
-            ).fetchone()
-
-            if not r:
-                raise ValueError
-
-            if action == "sa":
-                status = "approved"
-
-                c.execute(
-                    """UPDATE users
-                    SET balance=balance+?
-                    WHERE tg_id=?""",
-                    (r["reward"], r["user_id"])
-                )
-
-                message = (
-                    f"✅ Task Approved!\n"
-                    f"💰 Reward +৳{r['reward']:.2f}"
-                )
-
-            else:
-                status = "rejected"
-                message = "❌ Task Submission Rejected."
-
-            c.execute(
-                """UPDATE submissions
-                SET status=?,reviewed_at=?
-                WHERE id=?""",
-                (status, now(), rid)
-            )
-
-        elif action in ("da", "dr"):
-
-            r = c.execute(
-                """SELECT * FROM deposits
-                WHERE id=? AND status='pending'""",
-                (rid,)
-            ).fetchone()
-
-            if not r:
-                raise ValueError
-
-            if action == "da":
-                status = "approved"
-
-                c.execute(
-                    """UPDATE users
-                    SET balance=balance+?
-                    WHERE tg_id=?""",
-                    (r["amount"], r["user_id"])
-                )
-
-                message = (
-                    f"✅ Deposit Approved!\n"
-                    f"💰 +৳{r['amount']:.2f}"
-                )
-
-            else:
-                status = "rejected"
-                message = "❌ Deposit Rejected."
-
-            c.execute(
-                """UPDATE deposits
-                SET status=?,reviewed_at=?
-                WHERE id=?""",
-                (status, now(), rid)
-            )
-
-        elif action in ("wa", "wr"):
-
-            r = c.execute(
-                """SELECT * FROM withdrawals
-                WHERE id=? AND status='pending'""",
-                (rid,)
-            ).fetchone()
-
-            if not r:
-                raise ValueError
-
-            if action == "wa":
-                status = "approved"
-                message = "✅ Withdrawal Approved."
-
-            else:
-                status = "rejected"
-
-                c.execute(
-                    """UPDATE users
-                    SET balance=balance+?
-                    WHERE tg_id=?""",
-                    (r["amount"], r["user_id"])
-                )
-
-                message = (
-                    "❌ Withdrawal Rejected.\n"
-                    "💰 Amount refunded to your Balance."
-                )
-
-            c.execute(
-                """UPDATE withdrawals
-                SET status=?,reviewed_at=?
-                WHERE id=?""",
-                (status, now(), rid)
-            )
-
-        elif action == "tdel":
-
-            c.execute(
-                "UPDATE tasks SET active=0 WHERE id=?",
-                (rid,)
-            )
-
-            c.commit()
-            c.close()
-
-            await query.message.reply_text(
-                "🗑 Task deleted."
-            )
-            return
-
-        else:
-            raise ValueError
-
-        c.execute(
-            """INSERT INTO notifications
-            (user_id,message,created_at)
-            VALUES(?,?,?)""",
-            (
-                r["user_id"],
-                message,
-                now()
-            )
-        )
-
-        c.commit()
-
-        target = r["user_id"]
-
+        c.execute('begin immediate')
+        if action in ('sa','sr'):
+            r=c.execute('select * from submissions where id=? and status="pending"',(rid,)).fetchone()
+            if not r: raise ValueError('already')
+            status='approved' if action=='sa' else 'rejected'; c.execute('update submissions set status=?,reviewed_at=? where id=?',(status,now(),rid))
+            if action=='sa': c.execute('update users set balance=balance+? where tg_id=?',(r['reward'],r['user_id']))
+            msg=('✅ Task Approved!\n💰 Reward +৳%.2f'%r['reward']) if action=='sa' else '❌ Task Submission Rejected.'
+        elif action in ('da','dr'):
+            r=c.execute('select * from deposits where id=? and status="pending"',(rid,)).fetchone()
+            if not r: raise ValueError('already')
+            status='approved' if action=='da' else 'rejected'; c.execute('update deposits set status=?,reviewed_at=? where id=?',(status,now(),rid))
+            if action=='da': c.execute('update users set balance=balance+? where tg_id=?',(r['amount'],r['user_id']))
+            msg=('✅ Deposit Approved!\n💰 +৳%.2f'%r['amount']) if action=='da' else '❌ Deposit Rejected.'
+        elif action in ('wa','wr'):
+            r=c.execute('select * from withdrawals where id=? and status="pending"',(rid,)).fetchone()
+            if not r: raise ValueError('already')
+            status='approved' if action=='wa' else 'rejected'; c.execute('update withdrawals set status=?,reviewed_at=? where id=?',(status,now(),rid))
+            if action=='wr': c.execute('update users set balance=balance+? where tg_id=?',(r['amount'],r['user_id']))
+            msg='✅ Withdrawal Approved.' if action=='wa' else '❌ Withdrawal Rejected.\n💰 Amount refunded to your Balance.'
+        elif action=='tdel':
+            c.execute('update tasks set active=0 where id=?',(rid,)); c.commit(); c.close(); await q.message.reply_text('🗑 Task deleted.'); return
+        else: raise ValueError('bad')
+        c.execute('insert into notifications(user_id,message,created_at) values(?,?,?)',(r['user_id'],msg,now())); c.commit(); target=r['user_id']
     except ValueError:
+        c.rollback(); c.close(); await q.message.reply_text('⚠️ এই Request ইতিমধ্যে processed হয়েছে।'); return
+    c.close(); await q.message.reply_text('✅ Done.')
+    try: await ct.bot.send_message(target,msg)
+    except: pass
 
-        c.rollback()
-        c.close()
-
-        await query.message.reply_text(
-            "⚠️ এই Request ইতিমধ্যে processed হয়েছে।"
-        )
+async def text(u,ct):
+    uid=u.effective_user.id; t=u.message.text.strip()
+    if t=='❌ Cancel':
+        clear(uid)
+        await u.message.reply_text('❌ Cancel করা হয়েছে।',reply_markup=amenu() if uid==ADMIN else menu(uid))
         return
-
-    c.close()
-
-    await query.message.reply_text(
-        "✅ Done."
-    )
-
-    try:
-        await context.bot.send_message(
-            target,
-            message
-        )
-    except Exception:
-        pass
-
-
-async def text_handler(update, context):
-    uid = update.effective_user.id
-    text = update.message.text.strip()
-
-    if text == "🏠 Home":
-        return await home(update, context)
-
-    if text == "📋 Tasks":
-        return await tasks(update, context)
-
-    if text == "👤 Profile":
-        return await profile(update, context)
-
-    if text == "👥 Referral":
-        return await referral(update, context)
-
-    if text == "📜 History":
-        return await history(update, context)
-
-    if text == "📤 Submit":
-        await update.message.reply_text(
-            "📋 Tasks থেকে একটি Task-এর Submit Proof চাপুন।"
-        )
+    if t=='🏠 Home': return await home(u,ct)
+    if t=='📋 Tasks': return await tasks(u,ct)
+    if t=='👤 Profile': return await profile(u,ct)
+    if t=='👥 Referral': return await referral(u,ct)
+    if t=='📜 History': return await history(u,ct)
+    if t=='📤 Submit':
+        await u.message.reply_text('📋 Tasks থেকে একটি Task-এর Submit Proof চাপুন।'); return
+    if t=='💳 Deposit': STATE[uid]={'flow':'deposit','step':1,'data':{}}; await u.message.reply_text('Deposit Method নির্বাচন করুন:',reply_markup=method_menu()); return
+    if t=='💸 Withdraw': STATE[uid]={'flow':'withdraw','step':1,'data':{}}; await u.message.reply_text('Withdraw Method নির্বাচন করুন:',reply_markup=method_menu()); return
+    if t=='🔐 Admin': return await admin_menu(u,ct)
+    if uid==ADMIN:
+        if t=='➕ Add Task': STATE[uid]={'flow':'add','step':1,'data':{}}; await u.message.reply_text('Task Name লিখুন:',reply_markup=cancel_menu()); return
+        if t=='📋 Manage Tasks': return await admin_manage(u,ct)
+        if t=='📥 Submissions': return await admin_list(u,ct,'sub')
+        if t=='💳 Deposits': return await admin_list(u,ct,'dep')
+        if t=='💸 Withdrawals': return await admin_list(u,ct,'with')
+        if t=='⚙️ Settings': return await admin_settings(u,ct)
+        if t=='👥 Users': return await admin_users(u,ct)
+    s=STATE.get(uid)
+    if s:
+        if s['flow']=='adminpass':
+            if uid==ADMIN and t==PASSWORD: clear(uid); await u.message.reply_text('✅ Admin Login Successful',reply_markup=amenu())
+            else: await u.message.reply_text('❌ Password ভুল।')
+        elif s['flow']=='add': await add_task_flow(u,ct,s)
+        elif s['flow']=='submit': await submit_flow(u,ct,s)
+        elif s['flow']=='deposit': await deposit_flow(u,ct,s)
+        elif s['flow']=='withdraw': await withdraw_flow(u,ct,s)
+        elif s['flow']=='settings': await settings_flow(u,ct,s)
         return
+    await u.message.reply_text('Menu থেকে Option নির্বাচন করুন।',reply_markup=menu(uid))
 
-    if text == "💳 Deposit":
-        STATE[uid] = {
-            "flow": "deposit",
-            "step": 1,
-            "data": {}
-        }
+async def err(u,ct): print('ERROR:',ct.error)
 
-        await update.message.reply_text(
-            "Deposit Method লিখুন: bKash অথবা Nagad"
-        )
-        return
+def start_health_server():
+    # Render Web Services require an HTTP port to stay available.
+    # This tiny standard-library server avoids adding another package.
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    port=int(os.getenv('PORT','10000'))
 
-    if text == "💸 Withdraw":
-        STATE[uid] = {
-            "flow": "withdraw",
-            "step": 1,
-            "data": {}
-        }
-
-        await update.message.reply_text(
-            "Withdraw Method লিখুন: bKash অথবা Nagad"
-        )
-        return
-
-    if text == "🔐 Admin":
-        return await admin_login(update, context)
-
-    if uid == ADMIN:
-
-        if text == "➕ Add Task":
-            STATE[uid] = {
-                "flow": "add",
-                "step": 1,
-                "data": {}
-            }
-
-            await update.message.reply_text(
-                "Task Name লিখুন:"
-            )
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body=b'Limon BD Earning Bot is running'
+            self.send_response(200)
+            self.send_header('Content-Type','text/plain; charset=utf-8')
+            self.send_header('Content-Length',str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, format, *args):
             return
 
-        if text == "📋 Manage Tasks":
-            return await manage_tasks(update, context)
-
-        if text == "📥 Submissions":
-            return await admin_list(update, context, "sub")
-
-        if text == "💳 Deposits":
-            return await admin_list(update, context, "dep")
-
-        if text == "💸 Withdrawals":
-            return await admin_list(update, context, "with")
-
-        if text == "⚙️ Settings":
-            return await settings(update, context)
-
-        if text == "👥 Users":
-            return await users(update, context)
-
-    state = STATE.get(uid)
-
-    if state:
-
-        if state["flow"] == "adminpass":
-
-            if uid == ADMIN and text == PASSWORD:
-                clear(uid)
-
-                await update.message.reply_text(
-                    "✅ Admin Login Successful",
-                    reply_markup=admin_menu()
-                )
-
-            else:
-                await update.message.reply_text(
-                    "❌ Password ভুল।"
-                )
-
-        elif state["flow"] == "add":
-            await add_task(update, context, state)
-
-        elif state["flow"] == "submit":
-            await submit(update, context, state)
-
-        elif state["flow"] == "deposit":
-            await deposit(update, context, state)
-
-        elif state["flow"] == "withdraw":
-            await withdraw(update, context, state)
-
-        elif state["flow"] == "settings":
-            await settings_flow(update, context, state)
-
-        return
-
-    await update.message.reply_text(
-        "Menu থেকে Option নির্বাচন করুন।",
-        reply_markup=user_menu(uid)
-    )
-
-
-async def error_handler(update, context):
-    print("ERROR:", context.error)
-
-
-def health_server():
-    port = int(os.getenv("PORT", "10000"))
-
-    class Handler(BaseHTTPRequestHandler):
-
-        def do_GET(self):
-            body = b"Limon BD Earning Bot is running"
-
-            self.send_response(200)
-            self.send_header(
-                "Content-Type",
-                "text/plain"
-            )
-            self.send_header(
-                "Content-Length",
-                str(len(body))
-            )
-            self.end_headers()
-
-            self.wfile.write(body)
-
-        def log_message(self, format, *args):
-            pass
-
-    server = ThreadingHTTPServer(
-        ("0.0.0.0", port),
-        Handler
-    )
-
-    print("Health server running on port", port)
-
+    server=ThreadingHTTPServer(('0.0.0.0',port),HealthHandler)
+    print(f'Health server listening on 0.0.0.0:{port}')
     server.serve_forever()
 
-
 def main():
-
     init()
+    import threading
+    threading.Thread(target=start_health_server,daemon=True).start()
+    app=Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler('start',start))
+    app.add_handler(CallbackQueryHandler(callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text))
+    app.add_error_handler(err)
+    print('Limon BD Earning Bot চলছে...')
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    threading.Thread(
-        target=health_server,
-        daemon=True
-    ).start()
-
-    app = Application.builder().token(TOKEN).build()
-
-    app.add_handler(
-        CommandHandler("start", start)
-    )
-
-    app.add_handler(
-        CallbackQueryHandler(callback)
-    )
-
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            text_handler
-        )
-    )
-
-    app.add_error_handler(error_handler)
-
-    print("Limon BD Earning Bot চলছে...")
-
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES
-    )
-
-
-if __name__ == "__main__":
-    main()
+if __name__=='__main__': main()
