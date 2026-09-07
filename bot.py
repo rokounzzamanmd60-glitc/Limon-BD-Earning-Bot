@@ -101,16 +101,43 @@ async def add_task_flow(u,ct,s):
     else:
         d['link']='' if text=='-' else text; c=conn(); c.execute('insert into tasks(title,description,reward,link,created_at) values(?,?,?,?,?)',(d['title'],d['description'],d['reward'],d['link'],now())); c.commit(); c.close(); clear(uid); await u.message.reply_text('✅ Task Added!',reply_markup=amenu())
 
-async def submit_flow(u,ct,s):
-    uid=u.effective_user.id; tid=s['task']; proof=u.message.text
-    c=conn(); t=c.execute('select * from tasks where id=? and active=1',(tid,)).fetchone();
-    if not t: c.close(); clear(uid); await u.message.reply_text('❌ Task পাওয়া যায়নি.'); return
+async def submit_flow(u,ct,s,proof=None,photo_file_id=None):
+    uid=u.effective_user.id; tid=s['task']
+    if proof is None:
+        proof=(u.message.text or '').strip()
+    c=conn(); t=c.execute('select * from tasks where id=? and active=1',(tid,)).fetchone()
+    if not t:
+        c.close(); clear(uid); await u.message.reply_text('❌ Task পাওয়া যায়নি।',reply_markup=menu(uid)); return
     old=c.execute('select id from submissions where user_id=? and task_id=? and status="pending"',(uid,tid)).fetchone()
-    if old: c.close(); clear(uid); await u.message.reply_text('⏳ এই Task-এর একটি submission already pending.'); return
-    c.execute('insert into submissions(user_id,task_id,proof,reward,created_at) values(?,?,?,?,?)',(uid,tid,proof,t['reward'],now())); sid=c.lastrowid; c.commit(); c.close(); clear(uid)
+    if old:
+        c.close(); clear(uid); await u.message.reply_text('⏳ এই Task-এর একটি submission already pending.',reply_markup=menu(uid)); return
+    if not proof and not photo_file_id:
+        c.close(); await u.message.reply_text('❌ Proof দিন—লিখিত Proof অথবা Screenshot পাঠান।',reply_markup=cancel_menu()); return
+    stored_proof=proof if proof else '[Screenshot attached]'
+    c.execute('insert into submissions(user_id,task_id,proof,reward,created_at) values(?,?,?,?,?)',(uid,tid,stored_proof,t['reward'],now()))
+    sid=c.lastrowid; c.commit(); c.close(); clear(uid)
     kb=InlineKeyboardMarkup([[InlineKeyboardButton('✅ Approve',callback_data=f'sa:{sid}'),InlineKeyboardButton('❌ Reject',callback_data=f'sr:{sid}')]])
-    await ct.bot.send_message(ADMIN,f'📥 *New Task Submission*\n\n🆔 Submission: {sid}\n👤 User: {uid}\n📌 Task: #{tid} {t["title"]}\n💰 Reward: ৳{t["reward"]:.2f}\n\n📝 Proof:\n{proof}',parse_mode='Markdown',reply_markup=kb)
-    await u.message.reply_text('✅ Proof Admin-এর কাছে পাঠানো হয়েছে। Approval-এর জন্য অপেক্ষা করুন।',reply_markup=menu(uid))
+    admin_text=(f'📥 New Task Submission\n\n🆔 Submission: {sid}\n👤 User: {uid}\n📌 Task: #{tid} {t["title"]}\n💰 Reward: ৳{t["reward"]:.2f}\n\n📝 Proof:\n{stored_proof}')
+    admin_sent=False
+    try:
+        if photo_file_id:
+            await ct.bot.send_photo(ADMIN,photo=photo_file_id,caption=admin_text,reply_markup=kb)
+        else:
+            await ct.bot.send_message(ADMIN,admin_text,reply_markup=kb)
+        admin_sent=True
+    except Exception as e:
+        print('ADMIN SUBMISSION SEND ERROR:',e)
+    if admin_sent:
+        await u.message.reply_text('✅ Proof Admin-এর কাছে পাঠানো হয়েছে। Approval-এর জন্য অপেক্ষা করুন।',reply_markup=menu(uid))
+    else:
+        await u.message.reply_text('⚠️ Proof সংরক্ষণ হয়েছে, কিন্তু Admin-এর কাছে পাঠানো যায়নি। Admin যেন এই bot-এ /start দিয়ে রাখেন।',reply_markup=menu(uid))
+
+async def photo_proof(u,ct):
+    uid=u.effective_user.id; s=STATE.get(uid)
+    if not s or s.get('flow')!='submit':
+        return
+    photo=u.message.photo[-1]
+    await submit_flow(u,ct,s,proof='[Screenshot attached]',photo_file_id=photo.file_id)
 
 async def deposit_flow(u,ct,s):
     uid=u.effective_user.id; text=u.message.text.strip(); step=s['step']; d=s['data']
@@ -304,6 +331,7 @@ def main():
     app=Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler('start',start))
     app.add_handler(CallbackQueryHandler(callback))
+    app.add_handler(MessageHandler(filters.PHOTO,photo_proof))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text))
     app.add_error_handler(err)
     print('Limon BD Earning Bot চলছে...')
