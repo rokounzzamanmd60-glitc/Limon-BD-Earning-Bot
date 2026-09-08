@@ -58,11 +58,11 @@ def user(tg):
     c.close(); return r
 
 def menu(uid):
-    rows=[['🏠 Home','📋 Tasks'],['📤 Submit','💳 Deposit'],['💸 Withdraw','👥 Referral'],['📜 History','👤 Profile']]
+    rows=[['🏠 Home','📋 Tasks'],['💳 Deposit','💸 Withdraw'],['👥 Referral','📜 History'],['👤 Profile']]
     if uid==ADMIN: rows.append(['🔐 Admin'])
     return ReplyKeyboardMarkup(rows,resize_keyboard=True,is_persistent=True)
 
-def amenu(): return ReplyKeyboardMarkup([['➕ Add Task','📋 Manage Tasks'],['📥 Submissions','💳 Deposits'],['💸 Withdrawals','⚙️ Settings'],['👥 Users','🏠 Home']],resize_keyboard=True,is_persistent=True)
+def amenu(): return ReplyKeyboardMarkup([['➕ Add Task','📋 Manage Tasks'],['📥 Submissions','💳 Deposits'],['💸 Withdrawals','⚙️ Settings'],['📢 Broadcast','👥 Users'],['🏠 Home']],resize_keyboard=True,is_persistent=True)
 def cancel_menu(): return ReplyKeyboardMarkup([['❌ Cancel']], resize_keyboard=True, is_persistent=True)
 def method_menu(): return ReplyKeyboardMarkup([['bKash','Nagad'],['❌ Cancel']], resize_keyboard=True, is_persistent=True)
 def clear(uid): STATE.pop(uid,None)
@@ -158,8 +158,17 @@ async def deposit_flow(u,ct,s):
     else:
         d['trx']=text; c=conn(); c.execute('insert into deposits(user_id,method,amount,trx,created_at) values(?,?,?,?,?)',(uid,d['method'],d['amount'],d['trx'],now())); did=c.lastrowid; c.commit(); c.close(); clear(uid)
         kb=InlineKeyboardMarkup([[InlineKeyboardButton('✅ Approve',callback_data=f'da:{did}'),InlineKeyboardButton('❌ Reject',callback_data=f'dr:{did}')]])
-        await ct.bot.send_message(ADMIN,f'💳 *New Deposit*\n\nID: {did}\nUser: {uid}\nMethod: {d["method"]}\nAmount: ৳{d["amount"]:.2f}\nTrxID: `{d["trx"]}`',parse_mode='Markdown',reply_markup=kb)
-        await u.message.reply_text('✅ Deposit request পাঠানো হয়েছে।',reply_markup=menu(uid))
+        admin_sent=False
+        try:
+            admin_text=(f'💳 New Deposit\n\nID: {did}\nUser: {uid}\nMethod: {d["method"]}\nAmount: ৳{d["amount"]:.2f}\nTrxID: {d["trx"]}')
+            await ct.bot.send_message(ADMIN,admin_text,reply_markup=kb)
+            admin_sent=True
+        except Exception as e:
+            print('ADMIN DEPOSIT SEND ERROR:',e)
+        if admin_sent:
+            await u.message.reply_text('✅ Deposit request পাঠানো হয়েছে। Admin approval-এর জন্য অপেক্ষা করুন।',reply_markup=menu(uid))
+        else:
+            await u.message.reply_text('⚠️ Deposit request সংরক্ষণ হয়েছে, কিন্তু Admin-এর কাছে পাঠানো যায়নি। Admin যেন এই bot-এ /start দিয়ে রাখেন।',reply_markup=menu(uid))
 
 async def withdraw_flow(u,ct,s):
     uid=u.effective_user.id; text=u.message.text.strip(); step=s['step']; d=s['data']
@@ -183,8 +192,17 @@ async def withdraw_flow(u,ct,s):
         c.execute('update users set balance=balance-? where tg_id=?',(amount,uid))
         c.execute('insert into withdrawals(user_id,method,number,amount,created_at) values(?,?,?,?,?)',(uid,d['method'],d['number'],amount,now())); wid=c.lastrowid; c.commit(); c.close(); clear(uid)
         kb=InlineKeyboardMarkup([[InlineKeyboardButton('✅ Approve',callback_data=f'wa:{wid}'),InlineKeyboardButton('❌ Reject',callback_data=f'wr:{wid}')]])
-        await ct.bot.send_message(ADMIN,f'💸 *New Withdrawal*\n\nID: {wid}\nUser: {uid}\nMethod: {d["method"]}\nNumber: {d["number"]}\nAmount: ৳{amount:.2f}',parse_mode='Markdown',reply_markup=kb)
-        await u.message.reply_text('✅ Withdrawal request পাঠানো হয়েছে। Balance থেকে টাকা reserve করা হয়েছে।',reply_markup=menu(uid))
+        admin_sent=False
+        try:
+            admin_text=(f'💸 New Withdrawal\n\nID: {wid}\nUser: {uid}\nMethod: {d["method"]}\nNumber: {d["number"]}\nAmount: ৳{amount:.2f}')
+            await ct.bot.send_message(ADMIN,admin_text,reply_markup=kb)
+            admin_sent=True
+        except Exception as e:
+            print('ADMIN WITHDRAWAL SEND ERROR:',e)
+        if admin_sent:
+            await u.message.reply_text('✅ Withdrawal request পাঠানো হয়েছে। Balance থেকে টাকা reserve করা হয়েছে।',reply_markup=menu(uid))
+        else:
+            await u.message.reply_text('⚠️ Withdrawal request সংরক্ষণ হয়েছে, কিন্তু Admin-এর কাছে পাঠানো যায়নি। Admin যেন এই bot-এ /start দিয়ে রাখেন।',reply_markup=menu(uid))
 
 async def history(u,ct):
     uid=u.effective_user.id; clear(uid); c=conn(); a=c.execute('select * from submissions where user_id=? order by id desc limit 10',(uid,)).fetchall(); d=c.execute('select * from deposits where user_id=? order by id desc limit 10',(uid,)).fetchall(); w=c.execute('select * from withdrawals where user_id=? order by id desc limit 10',(uid,)).fetchall(); c.close(); out='📜 *History*\n\n📋 Submissions:\n'+('\n'.join(f'#{x["id"]} Task#{x["task_id"]} — {x["status"]} — ৳{x["reward"]:.2f}' for x in a) or 'None')+'\n\n💳 Deposits:\n'+('\n'.join(f'#{x["id"]} {x["method"]} ৳{x["amount"]:.2f} — {x["status"]}' for x in d) or 'None')+'\n\n💸 Withdrawals:\n'+('\n'.join(f'#{x["id"]} {x["method"]} ৳{x["amount"]:.2f} — {x["status"]}' for x in w) or 'None'); await u.message.reply_text(out,parse_mode='Markdown',reply_markup=menu(uid))
@@ -227,6 +245,31 @@ async def settings_flow(u,ct,s):
 
 async def admin_users(u,ct):
     c=conn(); n=c.execute('select count(*) c from users').fetchone()['c']; rows=c.execute('select tg_id,name,balance from users order by id desc limit 20').fetchall(); c.close(); txt=f'👥 Total Users: {n}\n\n'+'\n'.join(f'{r["tg_id"]} | {r["name"]} | ৳{r["balance"]:.2f}' for r in rows); await u.message.reply_text(txt,reply_markup=amenu())
+
+async def admin_broadcast(u,ct):
+    clear(u.effective_user.id)
+    STATE[u.effective_user.id]={'flow':'broadcast'}
+    await u.message.reply_text('📢 যে মেসেজটি সব User-এর কাছে পাঠাতে চান, সেটি লিখুন।\n\n❌ Cancel করতে Cancel চাপুন।',reply_markup=cancel_menu())
+
+async def do_broadcast(u,ct):
+    uid=u.effective_user.id
+    msg=(u.message.text or '').strip()
+    if not msg:
+        await u.message.reply_text('❌ খালি মেসেজ পাঠানো যাবে না।',reply_markup=cancel_menu())
+        return
+    c=conn(); rows=c.execute('select tg_id from users').fetchall(); c.close()
+    sent=0; failed=0
+    await u.message.reply_text(f'📢 Broadcast শুরু হয়েছে...\n👥 মোট User: {len(rows)}')
+    for r in rows:
+        try:
+            await ct.bot.send_message(r['tg_id'], f'📢 *Admin Message*\n\n{msg}', parse_mode='Markdown')
+            sent += 1
+        except Exception as e:
+            failed += 1
+            print('BROADCAST ERROR:', r['tg_id'], e)
+        await asyncio.sleep(0.05)
+    clear(uid)
+    await u.message.reply_text(f'✅ Broadcast শেষ।\n\n📤 সফলভাবে গেছে: {sent}\n⚠️ পাঠানো যায়নি: {failed}',reply_markup=amenu())
 
 async def callback(u,ct):
     q=u.callback_query; await q.answer(); uid=q.from_user.id; data=q.data
@@ -275,8 +318,6 @@ async def text(u,ct):
     if t=='👤 Profile': return await profile(u,ct)
     if t=='👥 Referral': return await referral(u,ct)
     if t=='📜 History': return await history(u,ct)
-    if t=='📤 Submit':
-        await u.message.reply_text('📋 Tasks থেকে একটি Task-এর Submit Proof চাপুন।'); return
     if t=='💳 Deposit': STATE[uid]={'flow':'deposit','step':1,'data':{}}; await u.message.reply_text('Deposit Method নির্বাচন করুন:',reply_markup=method_menu()); return
     if t=='💸 Withdraw': STATE[uid]={'flow':'withdraw','step':1,'data':{}}; await u.message.reply_text('Withdraw Method নির্বাচন করুন:',reply_markup=method_menu()); return
     if t=='🔐 Admin': return await admin_menu(u,ct)
@@ -287,6 +328,7 @@ async def text(u,ct):
         if t=='💳 Deposits': return await admin_list(u,ct,'dep')
         if t=='💸 Withdrawals': return await admin_list(u,ct,'with')
         if t=='⚙️ Settings': return await admin_settings(u,ct)
+        if t=='📢 Broadcast': return await admin_broadcast(u,ct)
         if t=='👥 Users': return await admin_users(u,ct)
     s=STATE.get(uid)
     if s:
@@ -298,6 +340,7 @@ async def text(u,ct):
         elif s['flow']=='deposit': await deposit_flow(u,ct,s)
         elif s['flow']=='withdraw': await withdraw_flow(u,ct,s)
         elif s['flow']=='settings': await settings_flow(u,ct,s)
+        elif s['flow']=='broadcast' and uid==ADMIN: await do_broadcast(u,ct)
         return
     await u.message.reply_text('Menu থেকে Option নির্বাচন করুন।',reply_markup=menu(uid))
 
