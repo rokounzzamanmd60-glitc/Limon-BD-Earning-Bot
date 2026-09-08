@@ -77,7 +77,11 @@ async def start(u,ct):
     clear(x.id); r=user(x)
     await u.message.reply_text(f'🎉 *Limon BD Earning*\n\n👋 স্বাগতম {x.full_name}!\n\n💰 Balance: ৳{r["balance"]:.2f}\n📋 Unlimited Tasks\n\nMenu থেকে Option নির্বাচন করুন।',parse_mode='Markdown',reply_markup=menu(x.id))
 
-async def home(u,ct): clear(u.effective_user.id); r=user(u.effective_user); await u.message.reply_text(f'🏠 *Home*\n\n💰 Balance: ৳{r["balance"]:.2f}',parse_mode='Markdown',reply_markup=menu(u.effective_user.id))
+async def home(u,ct): clear(u.effective_user.id); r=user(u.effective_user); await u.message.reply_text(f'💰 *Balance*\n\nবর্তমান Balance: ৳{r["balance"]:.2f}',parse_mode='Markdown',reply_markup=menu(u.effective_user.id))
+
+async def balance(u,ct):
+    clear(u.effective_user.id); r=user(u.effective_user)
+    await u.message.reply_text(f'💰 *Your Balance*\n\n৳{r["balance"]:.2f}',parse_mode='Markdown',reply_markup=menu(u.effective_user.id))
 async def profile(u,ct): clear(u.effective_user.id); r=user(u.effective_user); await u.message.reply_text(f'👤 *Profile*\n\n🆔 `{r["tg_id"]}`\n👤 {r["name"]}\n💰 ৳{r["balance"]:.2f}\n🎁 `{r["ref"]}`\n📅 {r["created_at"]}',parse_mode='Markdown',reply_markup=menu(u.effective_user.id))
 async def referral(u,ct):
     clear(u.effective_user.id); r=user(u.effective_user); b=(await ct.bot.get_me()).username; c=conn(); n=c.execute('select count(*) c from users where referred_by=?',(r['tg_id'],)).fetchone()['c']; c.close(); link=f'https://t.me/{b}?start=ref_{r["ref"]}'; await u.message.reply_text(f'👥 *Referral*\n\n🎁 প্রতি Referral: ৳{float(setting("ref_reward","2")):.2f}\n👥 Total: {n}\n\n🔗 `{link}`',parse_mode='Markdown',reply_markup=menu(r['tg_id']))
@@ -87,7 +91,11 @@ async def tasks(u,ct):
     if not rows: await u.message.reply_text('📋 এখন কোনো Task নেই।',reply_markup=menu(u.effective_user.id)); return
     await u.message.reply_text(f'📋 মোট {len(rows)}টি Task আছে।')
     for t in rows:
-        kb=InlineKeyboardMarkup([[InlineKeyboardButton('📤 Submit Proof',callback_data=f'sub:{t["id"]}')]])
+        buttons=[]
+        if t['link']:
+            buttons.append(InlineKeyboardButton('🔗 Open Task',url=t['link']))
+        buttons.append(InlineKeyboardButton('📤 Submit Proof',callback_data=f'sub:{t["id"]}'))
+        kb=InlineKeyboardMarkup([buttons])
         await u.message.reply_text(f'📌 *#{t["id"]} {t["title"]}*\n\n{t["description"]}\n\n💰 Reward: ৳{t["reward"]:.2f}\n🔗 {t["link"] or "নেই"}',parse_mode='Markdown',reply_markup=kb)
 
 async def add_task_flow(u,ct,s):
@@ -103,16 +111,17 @@ async def add_task_flow(u,ct,s):
 
 async def submit_flow(u,ct,s,proof=None,photo_file_id=None):
     uid=u.effective_user.id; tid=s['task']
+    reply_target = u.message or (u.callback_query.message if u.callback_query else None)
     if proof is None:
         proof=(u.message.text or '').strip()
     c=conn(); t=c.execute('select * from tasks where id=? and active=1',(tid,)).fetchone()
     if not t:
-        c.close(); clear(uid); await u.message.reply_text('❌ Task পাওয়া যায়নি।',reply_markup=menu(uid)); return
+        c.close(); clear(uid); await reply_target.reply_text('❌ Task পাওয়া যায়নি।',reply_markup=menu(uid)); return
     old=c.execute('select id from submissions where user_id=? and task_id=? and status="pending"',(uid,tid)).fetchone()
     if old:
-        c.close(); clear(uid); await u.message.reply_text('⏳ এই Task-এর একটি submission already pending.',reply_markup=menu(uid)); return
+        c.close(); clear(uid); await reply_target.reply_text('⏳ এই Task-এর একটি submission already pending.',reply_markup=menu(uid)); return
     if not proof and not photo_file_id:
-        c.close(); await u.message.reply_text('❌ Proof দিন—লিখিত Proof অথবা Screenshot পাঠান।',reply_markup=cancel_menu()); return
+        c.close(); await reply_target.reply_text('❌ Proof দিন—লিখিত Proof অথবা Screenshot পাঠান।',reply_markup=cancel_menu()); return
     stored_proof=proof if proof else '[Screenshot attached]'
     c.execute('insert into submissions(user_id,task_id,proof,reward,created_at) values(?,?,?,?,?)',(uid,tid,stored_proof,t['reward'],now()))
     sid=c.lastrowid; c.commit(); c.close(); clear(uid)
@@ -128,9 +137,9 @@ async def submit_flow(u,ct,s,proof=None,photo_file_id=None):
     except Exception as e:
         print('ADMIN SUBMISSION SEND ERROR:',e)
     if admin_sent:
-        await u.message.reply_text('✅ Proof Admin-এর কাছে পাঠানো হয়েছে। Approval-এর জন্য অপেক্ষা করুন।',reply_markup=menu(uid))
+        await reply_target.reply_text('✅ Proof Admin-এর কাছে পাঠানো হয়েছে। Approval-এর জন্য অপেক্ষা করুন।',reply_markup=menu(uid))
     else:
-        await u.message.reply_text('⚠️ Proof সংরক্ষণ হয়েছে, কিন্তু Admin-এর কাছে পাঠানো যায়নি। Admin যেন এই bot-এ /start দিয়ে রাখেন।',reply_markup=menu(uid))
+        await reply_target.reply_text('⚠️ Proof সংরক্ষণ হয়েছে, কিন্তু Admin-এর কাছে পাঠানো যায়নি। Admin যেন এই bot-এ /start দিয়ে রাখেন।',reply_markup=menu(uid))
 
 async def photo_proof(u,ct):
     uid=u.effective_user.id; s=STATE.get(uid)
@@ -274,7 +283,19 @@ async def do_broadcast(u,ct):
 async def callback(u,ct):
     q=u.callback_query; await q.answer(); uid=q.from_user.id; data=q.data
     if data.startswith('sub:'):
-        tid=int(data.split(':')[1]); STATE[uid]={'flow':'submit','task':tid}; await q.message.reply_text('📤 Proof পাঠান (Screenshot নয় হলে Link/লিখিত Proof দিন):',reply_markup=cancel_menu()); return
+        tid=int(data.split(':')[1]); STATE[uid]={'flow':'submit','task':tid}
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton('✅ Done',callback_data=f'done:{tid}')],[InlineKeyboardButton('❌ Cancel',callback_data='scancel')]])
+        await q.message.reply_text('📤 Task শেষ হলে নিচের Done বাটনে চাপুন।',reply_markup=kb); return
+    if data == 'scancel':
+        clear(uid); await q.message.reply_text('❌ Cancel করা হয়েছে।',reply_markup=menu(uid)); return
+    if data.startswith('done:'):
+        tid=int(data.split(':')[1])
+        s=STATE.get(uid)
+        if not s or s.get('flow')!='submit' or s.get('task')!=tid:
+            STATE[uid]={'flow':'submit','task':tid}
+            s=STATE[uid]
+        await submit_flow(u,ct,s,proof='Done')
+        return
     if uid!=ADMIN: return
     action,id_=data.split(':'); rid=int(id_); c=conn()
     try:
@@ -313,6 +334,7 @@ async def text(u,ct):
         clear(uid)
         await u.message.reply_text('❌ Cancel করা হয়েছে।',reply_markup=amenu() if uid==ADMIN else menu(uid))
         return
+    if t=='💰 Balance': return await balance(u,ct)
     if t=='🏠 Home': return await home(u,ct)
     if t=='📋 Tasks': return await tasks(u,ct)
     if t=='👤 Profile': return await profile(u,ct)
