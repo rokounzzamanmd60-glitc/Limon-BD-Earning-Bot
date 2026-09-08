@@ -1,405 +1,617 @@
-import os, sqlite3, secrets, asyncio
+import os, sqlite3, secrets, asyncio, threading
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
-DB='limon_bd.db'
-CONFIG='config.txt'
-STATE={}
+DB = 'limon_bd.db'
+CONFIG = 'config.txt'
+STATE = {}
 
-def now(): return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+def now():
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
 def conn():
-    c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
+    c = sqlite3.connect(DB, timeout=15)
+    c.row_factory = sqlite3.Row
+    return c
 
-def setting(k,d=''):
-    c=conn(); r=c.execute('select value from settings where key=?',(k,)).fetchone(); c.close(); return r['value'] if r else d
 
-def set_setting(k,v):
-    c=conn(); c.execute('insert into settings(key,value) values(?,?) on conflict(key) do update set value=excluded.value',(k,str(v))); c.commit(); c.close()
+def setting(key, default=''):
+    c = conn()
+    try:
+        r = c.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+        return r['value'] if r else default
+    finally:
+        c.close()
+
+
+def set_setting(key, value):
+    c = conn()
+    try:
+        c.execute('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, str(value)))
+        c.commit()
+    finally:
+        c.close()
+
 
 def init():
-    c=conn(); q=c.execute
-    q('create table if not exists settings(key text primary key,value text)')
-    q('create table if not exists users(id integer primary key autoincrement,tg_id integer unique,name text,username text,balance real default 0,ref text unique,referred_by integer,ref_paid integer default 0,created_at text)')
-    q('create table if not exists tasks(id integer primary key autoincrement,title text,description text,reward real,link text,active integer default 1,created_at text)')
-    q('create table if not exists submissions(id integer primary key autoincrement,user_id integer,task_id integer,proof text,reward real,status text default "pending",created_at text,reviewed_at text)')
-    q('create table if not exists deposits(id integer primary key autoincrement,user_id integer,method text,amount real,trx text,status text default "pending",created_at text,reviewed_at text)')
-    q('create table if not exists withdrawals(id integer primary key autoincrement,user_id integer,method text,number text,amount real,status text default "pending",created_at text,reviewed_at text)')
-    q('create table if not exists notifications(id integer primary key autoincrement,user_id integer,message text,created_at text,is_read integer default 0)')
-    for k,v in {'bkash':'017XXXXXXXX','nagad':'019XXXXXXXX','ref_reward':'2','min_withdraw':'50'}.items(): q('insert or ignore into settings values(?,?)',(k,v))
+    # IMPORTANT: create-if-not-exists only. Existing data is never deleted.
+    c = conn(); q = c.execute
+    q('CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT)')
+    q('CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,tg_id INTEGER UNIQUE,name TEXT,username TEXT,balance REAL DEFAULT 0,ref TEXT UNIQUE,referred_by INTEGER,ref_paid INTEGER DEFAULT 0,created_at TEXT)')
+    q('CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT,description TEXT,reward REAL,link TEXT,active INTEGER DEFAULT 1,created_at TEXT)')
+    q('CREATE TABLE IF NOT EXISTS submissions(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,task_id INTEGER,proof TEXT,reward REAL,status TEXT DEFAULT "pending",created_at TEXT,reviewed_at TEXT)')
+    q('CREATE TABLE IF NOT EXISTS deposits(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,method TEXT,amount REAL,trx TEXT,status TEXT DEFAULT "pending",created_at TEXT,reviewed_at TEXT)')
+    q('CREATE TABLE IF NOT EXISTS withdrawals(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,method TEXT,number TEXT,amount REAL,status TEXT DEFAULT "pending",created_at TEXT,reviewed_at TEXT)')
+    q('CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,message TEXT,created_at TEXT,is_read INTEGER DEFAULT 0)')
+    for k, v in {'bkash':'017XXXXXXXX','nagad':'019XXXXXXXX','ref_reward':'2','min_withdraw':'50'}.items():
+        q('INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)', (k, v))
     c.commit(); c.close()
 
+
 def load_config():
-    # Render/Web Service uses Environment Variables instead of interactive input.
-    token=os.getenv('BOT_TOKEN','').strip()
-    aid=os.getenv('ADMIN_ID','').strip()
-    pwd=os.getenv('ADMIN_PASSWORD','12345').strip() or '12345'
+    token = os.getenv('BOT_TOKEN', '').strip()
+    aid = os.getenv('ADMIN_ID', '').strip()
+    pwd = os.getenv('ADMIN_PASSWORD', '12345').strip() or '12345'
     if token and aid:
         try:
             return token, int(aid), pwd
         except ValueError:
             raise RuntimeError('ADMIN_ID must be a numeric Telegram user ID.')
-
-    # Optional local fallback: config.txt can still be used when running on a PC/mobile terminal.
     if os.path.exists(CONFIG):
-        a=open(CONFIG,encoding='utf-8').read().splitlines()
+        a = open(CONFIG, encoding='utf-8').read().splitlines()
         if len(a) >= 2 and a[0].strip() and a[1].strip():
             return a[0].strip(), int(a[1].strip()), (a[2].strip() if len(a) >= 3 and a[2].strip() else '12345')
-
     raise RuntimeError('BOT_TOKEN and ADMIN_ID environment variables are required on Render.')
 
-TOKEN,ADMIN,PASSWORD=load_config()
+
+TOKEN, ADMIN, PASSWORD = load_config()
+
+
+def clear(uid):
+    STATE.pop(uid, None)
+
 
 def user(tg):
-    c=conn(); r=c.execute('select * from users where tg_id=?',(tg.id,)).fetchone()
-    if not r:
-        ref=secrets.token_hex(4).upper(); c.execute('insert into users(tg_id,name,username,ref,created_at) values(?,?,?,?,?)',(tg.id,tg.full_name,tg.username or '',ref,now())); c.commit(); r=c.execute('select * from users where tg_id=?',(tg.id,)).fetchone()
-    else: c.execute('update users set name=?,username=? where tg_id=?',(tg.full_name,tg.username or '',tg.id)); c.commit()
-    c.close(); return r
+    c = conn()
+    try:
+        r = c.execute('SELECT * FROM users WHERE tg_id=?', (tg.id,)).fetchone()
+        if not r:
+            ref = secrets.token_hex(4).upper()
+            c.execute('INSERT INTO users(tg_id,name,username,ref,created_at) VALUES(?,?,?,?,?)',
+                      (tg.id, tg.full_name, tg.username or '', ref, now()))
+            c.commit()
+            r = c.execute('SELECT * FROM users WHERE tg_id=?', (tg.id,)).fetchone()
+        else:
+            c.execute('UPDATE users SET name=?,username=? WHERE tg_id=?',
+                      (tg.full_name, tg.username or '', tg.id))
+            c.commit()
+        return r
+    finally:
+        c.close()
+
 
 def menu(uid):
-    rows=[['🏠 Home','📋 Tasks'],['💳 Deposit','💸 Withdraw'],['👥 Referral','📜 History'],['👤 Profile']]
-    if uid==ADMIN: rows.append(['🔐 Admin'])
-    return ReplyKeyboardMarkup(rows,resize_keyboard=True,is_persistent=True)
+    rows = [
+        ['💰 Balance', '📋 Tasks'],
+        ['💳 Deposit', '💸 Withdraw'],
+        ['👥 Referral', '📜 History'],
+        ['👤 Profile'],
+    ]
+    if uid == ADMIN:
+        rows.append(['🔐 Admin'])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
-def amenu(): return ReplyKeyboardMarkup([['➕ Add Task','📋 Manage Tasks'],['📥 Submissions','💳 Deposits'],['💸 Withdrawals','⚙️ Settings'],['📢 Broadcast','👥 Users'],['🏠 Home']],resize_keyboard=True,is_persistent=True)
-def cancel_menu(): return ReplyKeyboardMarkup([['❌ Cancel']], resize_keyboard=True, is_persistent=True)
-def method_menu(): return ReplyKeyboardMarkup([['bKash','Nagad'],['❌ Cancel']], resize_keyboard=True, is_persistent=True)
-def clear(uid): STATE.pop(uid,None)
 
-async def start(u,ct):
-    x=u.effective_user; user(x)
-    if ct.args and ct.args[0].startswith('ref_'):
-        code=ct.args[0][4:]; c=conn(); me=c.execute('select * from users where tg_id=?',(x.id,)).fetchone(); rr=c.execute('select * from users where ref=?',(code,)).fetchone()
-        if rr and rr['tg_id']!=x.id and me['referred_by'] is None:
-            rew=float(setting('ref_reward','2')); c.execute('update users set referred_by=? where tg_id=?',(rr['tg_id'],x.id)); c.execute('update users set balance=balance+? where tg_id=?',(rew,rr['tg_id'])); c.execute('insert into notifications(user_id,message,created_at) values(?,?,?)',(rr['tg_id'],f'🎉 Referral Bonus +৳{rew:.2f}',now())); c.commit()
-        c.close()
-    clear(x.id); r=user(x)
-    await u.message.reply_text(f'🎉 *Limon BD Earning*\n\n👋 স্বাগতম {x.full_name}!\n\n💰 Balance: ৳{r["balance"]:.2f}\n📋 Unlimited Tasks\n\nMenu থেকে Option নির্বাচন করুন।',parse_mode='Markdown',reply_markup=menu(x.id))
+def amenu():
+    return ReplyKeyboardMarkup([
+        ['➕ Add Task', '📋 Manage Tasks'],
+        ['📥 Submissions', '💳 Deposits'],
+        ['💸 Withdrawals', '⚙️ Settings'],
+        ['📢 Broadcast', '👥 Users'],
+        ['🏠 User Menu'],
+    ], resize_keyboard=True, is_persistent=True)
 
-async def home(u,ct): clear(u.effective_user.id); r=user(u.effective_user); await u.message.reply_text(f'💰 *Balance*\n\nবর্তমান Balance: ৳{r["balance"]:.2f}',parse_mode='Markdown',reply_markup=menu(u.effective_user.id))
 
-async def balance(u,ct):
-    clear(u.effective_user.id); r=user(u.effective_user)
-    await u.message.reply_text(f'💰 *Your Balance*\n\n৳{r["balance"]:.2f}',parse_mode='Markdown',reply_markup=menu(u.effective_user.id))
-async def profile(u,ct): clear(u.effective_user.id); r=user(u.effective_user); await u.message.reply_text(f'👤 *Profile*\n\n🆔 `{r["tg_id"]}`\n👤 {r["name"]}\n💰 ৳{r["balance"]:.2f}\n🎁 `{r["ref"]}`\n📅 {r["created_at"]}',parse_mode='Markdown',reply_markup=menu(u.effective_user.id))
-async def referral(u,ct):
-    clear(u.effective_user.id); r=user(u.effective_user); b=(await ct.bot.get_me()).username; c=conn(); n=c.execute('select count(*) c from users where referred_by=?',(r['tg_id'],)).fetchone()['c']; c.close(); link=f'https://t.me/{b}?start=ref_{r["ref"]}'; await u.message.reply_text(f'👥 *Referral*\n\n🎁 প্রতি Referral: ৳{float(setting("ref_reward","2")):.2f}\n👥 Total: {n}\n\n🔗 `{link}`',parse_mode='Markdown',reply_markup=menu(r['tg_id']))
+def cancel_menu():
+    return ReplyKeyboardMarkup([['❌ Cancel']], resize_keyboard=True, is_persistent=True)
 
-async def tasks(u,ct):
-    clear(u.effective_user.id); c=conn(); rows=c.execute('select * from tasks where active=1 order by id desc').fetchall(); c.close()
-    if not rows: await u.message.reply_text('📋 এখন কোনো Task নেই।',reply_markup=menu(u.effective_user.id)); return
-    await u.message.reply_text(f'📋 মোট {len(rows)}টি Task আছে।')
-    for t in rows:
-        buttons=[]
-        if t['link']:
-            buttons.append(InlineKeyboardButton('🔗 Open Task',url=t['link']))
-        buttons.append(InlineKeyboardButton('📤 Submit Proof',callback_data=f'sub:{t["id"]}'))
-        kb=InlineKeyboardMarkup([buttons])
-        await u.message.reply_text(f'📌 *#{t["id"]} {t["title"]}*\n\n{t["description"]}\n\n💰 Reward: ৳{t["reward"]:.2f}\n🔗 {t["link"] or "নেই"}',parse_mode='Markdown',reply_markup=kb)
 
-async def add_task_flow(u,ct,s):
-    uid=u.effective_user.id; text=u.message.text
-    step=s['step']; d=s['data']
-    if step==1: d['title']=text; s['step']=2; await u.message.reply_text('Task Description লিখুন:',reply_markup=cancel_menu())
-    elif step==2: d['description']=text; s['step']=3; await u.message.reply_text('Reward কত টাকা? শুধু সংখ্যা লিখুন:',reply_markup=cancel_menu())
-    elif step==3:
-        try: d['reward']=float(text); s['step']=4; await u.message.reply_text('Task Link দিন (না থাকলে - লিখুন):',reply_markup=cancel_menu())
-        except: await u.message.reply_text('❌ Reward শুধু সংখ্যা হবে। যেমন 10')
-    else:
-        d['link']='' if text=='-' else text; c=conn(); c.execute('insert into tasks(title,description,reward,link,created_at) values(?,?,?,?,?)',(d['title'],d['description'],d['reward'],d['link'],now())); c.commit(); c.close(); clear(uid); await u.message.reply_text('✅ Task Added!',reply_markup=amenu())
+def method_menu():
+    return ReplyKeyboardMarkup([['bKash', 'Nagad'], ['❌ Cancel']], resize_keyboard=True, is_persistent=True)
 
-async def submit_flow(u,ct,s,proof=None,photo_file_id=None):
-    uid=u.effective_user.id; tid=s['task']
-    reply_target = u.message or (u.callback_query.message if u.callback_query else None)
-    if proof is None:
-        proof=(u.message.text or '').strip()
-    c=conn(); t=c.execute('select * from tasks where id=? and active=1',(tid,)).fetchone()
-    if not t:
-        c.close(); clear(uid); await reply_target.reply_text('❌ Task পাওয়া যায়নি।',reply_markup=menu(uid)); return
-    old=c.execute('select id from submissions where user_id=? and task_id=? and status="pending"',(uid,tid)).fetchone()
-    if old:
-        c.close(); clear(uid); await reply_target.reply_text('⏳ এই Task-এর একটি submission already pending.',reply_markup=menu(uid)); return
-    if not proof and not photo_file_id:
-        c.close(); await reply_target.reply_text('❌ Proof দিন—লিখিত Proof অথবা Screenshot পাঠান।',reply_markup=cancel_menu()); return
-    stored_proof=proof if proof else '[Screenshot attached]'
-    c.execute('insert into submissions(user_id,task_id,proof,reward,created_at) values(?,?,?,?,?)',(uid,tid,stored_proof,t['reward'],now()))
-    sid=c.lastrowid; c.commit(); c.close(); clear(uid)
-    kb=InlineKeyboardMarkup([[InlineKeyboardButton('✅ Approve',callback_data=f'sa:{sid}'),InlineKeyboardButton('❌ Reject',callback_data=f'sr:{sid}')]])
-    admin_text=(f'📥 New Task Submission\n\n🆔 Submission: {sid}\n👤 User: {uid}\n📌 Task: #{tid} {t["title"]}\n💰 Reward: ৳{t["reward"]:.2f}\n\n📝 Proof:\n{stored_proof}')
-    admin_sent=False
+
+async def safe_admin_message(ct, text, reply_markup=None, photo_file_id=None):
+    """Try to notify admin without blocking the user flow for a long time."""
     try:
         if photo_file_id:
-            await ct.bot.send_photo(ADMIN,photo=photo_file_id,caption=admin_text,reply_markup=kb)
+            await asyncio.wait_for(ct.bot.send_photo(ADMIN, photo=photo_file_id, caption=text, reply_markup=reply_markup), 12)
         else:
-            await ct.bot.send_message(ADMIN,admin_text,reply_markup=kb)
-        admin_sent=True
+            await asyncio.wait_for(ct.bot.send_message(ADMIN, text, reply_markup=reply_markup), 12)
+        return True
     except Exception as e:
-        print('ADMIN SUBMISSION SEND ERROR:',e)
-    if admin_sent:
-        await reply_target.reply_text('✅ Proof Admin-এর কাছে পাঠানো হয়েছে। Approval-এর জন্য অপেক্ষা করুন।',reply_markup=menu(uid))
-    else:
-        await reply_target.reply_text('⚠️ Proof সংরক্ষণ হয়েছে, কিন্তু Admin-এর কাছে পাঠানো যায়নি। Admin যেন এই bot-এ /start দিয়ে রাখেন।',reply_markup=menu(uid))
+        print('ADMIN MESSAGE ERROR:', repr(e))
+        return False
 
-async def photo_proof(u,ct):
-    uid=u.effective_user.id; s=STATE.get(uid)
-    if not s or s.get('flow')!='submit':
-        return
-    photo=u.message.photo[-1]
-    await submit_flow(u,ct,s,proof='[Screenshot attached]',photo_file_id=photo.file_id)
 
-async def deposit_flow(u,ct,s):
-    uid=u.effective_user.id; text=u.message.text.strip(); step=s['step']; d=s['data']
-    if step==1:
-        if text not in ('bKash','Nagad'):
-            await u.message.reply_text('নিচের bKash অথবা Nagad বাটনে চাপুন।',reply_markup=method_menu()); return
-        d['method']=text; s['step']=2
-        num=setting(text.lower(),'')
-        await u.message.reply_text(f'💳 {text} Number: {num}\n\nকত টাকা Deposit করবেন?',reply_markup=cancel_menu())
-    elif step==2:
+async def notify_user(ct, uid, text):
+    try:
+        await asyncio.wait_for(ct.bot.send_message(uid, text), 12)
+        return True
+    except Exception as e:
+        print('USER NOTIFY ERROR:', uid, repr(e))
+        return False
+
+
+async def start(u, ct):
+    x = u.effective_user
+    user(x)
+    if ct.args and ct.args[0].startswith('ref_'):
+        code = ct.args[0][4:]
+        c = conn()
         try:
-            amount=float(text)
-            if amount<=0: raise ValueError
-            d['amount']=amount; s['step']=3
-            await u.message.reply_text('Transaction ID (TrxID) লিখুন:',reply_markup=cancel_menu())
-        except ValueError:
-            await u.message.reply_text('❌ সঠিক Amount দিন।',reply_markup=cancel_menu())
-    else:
-        d['trx']=text; c=conn(); c.execute('insert into deposits(user_id,method,amount,trx,created_at) values(?,?,?,?,?)',(uid,d['method'],d['amount'],d['trx'],now())); did=c.lastrowid; c.commit(); c.close(); clear(uid)
-        kb=InlineKeyboardMarkup([[InlineKeyboardButton('✅ Approve',callback_data=f'da:{did}'),InlineKeyboardButton('❌ Reject',callback_data=f'dr:{did}')]])
-        admin_sent=False
-        try:
-            admin_text=(f'💳 New Deposit\n\nID: {did}\nUser: {uid}\nMethod: {d["method"]}\nAmount: ৳{d["amount"]:.2f}\nTrxID: {d["trx"]}')
-            await ct.bot.send_message(ADMIN,admin_text,reply_markup=kb)
-            admin_sent=True
-        except Exception as e:
-            print('ADMIN DEPOSIT SEND ERROR:',e)
-        if admin_sent:
-            await u.message.reply_text('✅ Deposit request পাঠানো হয়েছে। Admin approval-এর জন্য অপেক্ষা করুন।',reply_markup=menu(uid))
-        else:
-            await u.message.reply_text('⚠️ Deposit request সংরক্ষণ হয়েছে, কিন্তু Admin-এর কাছে পাঠানো যায়নি। Admin যেন এই bot-এ /start দিয়ে রাখেন।',reply_markup=menu(uid))
+            me = c.execute('SELECT * FROM users WHERE tg_id=?', (x.id,)).fetchone()
+            rr = c.execute('SELECT * FROM users WHERE ref=?', (code,)).fetchone()
+            if rr and rr['tg_id'] != x.id and me['referred_by'] is None:
+                rew = float(setting('ref_reward', '2'))
+                c.execute('UPDATE users SET referred_by=? WHERE tg_id=?', (rr['tg_id'], x.id))
+                c.execute('UPDATE users SET balance=balance+? WHERE tg_id=?', (rew, rr['tg_id']))
+                c.execute('INSERT INTO notifications(user_id,message,created_at) VALUES(?,?,?)',
+                          (rr['tg_id'], f'🎉 Referral Bonus +৳{rew:.2f}', now()))
+                c.commit()
+                await notify_user(ct, rr['tg_id'], f'🎉 Referral Bonus +৳{rew:.2f}')
+        finally:
+            c.close()
+    clear(x.id)
+    r = user(x)
+    await u.message.reply_text(
+        f'🎉 Limon BD Earning\n\n👋 স্বাগতম {x.full_name}!\n\n💰 Balance: ৳{r["balance"]:.2f}\n📋 Unlimited Tasks\n\nMenu থেকে Option নির্বাচন করুন।',
+        reply_markup=menu(x.id)
+    )
 
-async def withdraw_flow(u,ct,s):
-    uid=u.effective_user.id; text=u.message.text.strip(); step=s['step']; d=s['data']
-    if step==1:
-        if text not in ('bKash','Nagad'):
-            await u.message.reply_text('নিচের bKash অথবা Nagad বাটনে চাপুন।',reply_markup=method_menu()); return
-        d['method']=text; s['step']=2
-        await u.message.reply_text(f'{text} Number লিখুন:',reply_markup=cancel_menu())
-    elif step==2:
-        d['number']=text; s['step']=3
-        await u.message.reply_text(f'Minimum Withdraw: ৳{setting("min_withdraw","50")}\n\nAmount লিখুন:',reply_markup=cancel_menu())
-    else:
-        try:
-            amount=float(text); minimum=float(setting('min_withdraw','50'))
-            if amount<minimum: await u.message.reply_text(f'❌ Minimum Withdraw ৳{minimum:.2f}',reply_markup=cancel_menu()); return
-            if amount<=0: raise ValueError
-        except ValueError:
-            await u.message.reply_text('❌ সঠিক Amount দিন।',reply_markup=cancel_menu()); return
-        c=conn(); r=c.execute('select balance from users where tg_id=?',(uid,)).fetchone()
-        if not r or r['balance']<amount: c.close(); await u.message.reply_text('❌ আপনার Balance যথেষ্ট নয়।',reply_markup=cancel_menu()); return
-        c.execute('update users set balance=balance-? where tg_id=?',(amount,uid))
-        c.execute('insert into withdrawals(user_id,method,number,amount,created_at) values(?,?,?,?,?)',(uid,d['method'],d['number'],amount,now())); wid=c.lastrowid; c.commit(); c.close(); clear(uid)
-        kb=InlineKeyboardMarkup([[InlineKeyboardButton('✅ Approve',callback_data=f'wa:{wid}'),InlineKeyboardButton('❌ Reject',callback_data=f'wr:{wid}')]])
-        admin_sent=False
-        try:
-            admin_text=(f'💸 New Withdrawal\n\nID: {wid}\nUser: {uid}\nMethod: {d["method"]}\nNumber: {d["number"]}\nAmount: ৳{amount:.2f}')
-            await ct.bot.send_message(ADMIN,admin_text,reply_markup=kb)
-            admin_sent=True
-        except Exception as e:
-            print('ADMIN WITHDRAWAL SEND ERROR:',e)
-        if admin_sent:
-            await u.message.reply_text('✅ Withdrawal request পাঠানো হয়েছে। Balance থেকে টাকা reserve করা হয়েছে।',reply_markup=menu(uid))
-        else:
-            await u.message.reply_text('⚠️ Withdrawal request সংরক্ষণ হয়েছে, কিন্তু Admin-এর কাছে পাঠানো যায়নি। Admin যেন এই bot-এ /start দিয়ে রাখেন।',reply_markup=menu(uid))
 
-async def history(u,ct):
-    uid=u.effective_user.id; clear(uid); c=conn(); a=c.execute('select * from submissions where user_id=? order by id desc limit 10',(uid,)).fetchall(); d=c.execute('select * from deposits where user_id=? order by id desc limit 10',(uid,)).fetchall(); w=c.execute('select * from withdrawals where user_id=? order by id desc limit 10',(uid,)).fetchall(); c.close(); out='📜 *History*\n\n📋 Submissions:\n'+('\n'.join(f'#{x["id"]} Task#{x["task_id"]} — {x["status"]} — ৳{x["reward"]:.2f}' for x in a) or 'None')+'\n\n💳 Deposits:\n'+('\n'.join(f'#{x["id"]} {x["method"]} ৳{x["amount"]:.2f} — {x["status"]}' for x in d) or 'None')+'\n\n💸 Withdrawals:\n'+('\n'.join(f'#{x["id"]} {x["method"]} ৳{x["amount"]:.2f} — {x["status"]}' for x in w) or 'None'); await u.message.reply_text(out,parse_mode='Markdown',reply_markup=menu(uid))
+async def balance(u, ct):
+    uid = u.effective_user.id; clear(uid); r = user(u.effective_user)
+    await u.message.reply_text(f'💰 Your Balance\n\n৳{r["balance"]:.2f}', reply_markup=menu(uid))
 
-async def admin_menu(u,ct):
-    if u.effective_user.id!=ADMIN: await u.message.reply_text('❌ Access Denied'); return
-    clear(ADMIN); STATE[ADMIN]={'flow':'adminpass'}; await u.message.reply_text('🔐 Admin Password লিখুন:')
 
-async def admin_manage(u,ct):
-    c=conn(); rows=c.execute('select * from tasks order by id desc').fetchall(); c.close();
-    if not rows: await u.message.reply_text('📋 কোনো Task নেই।',reply_markup=amenu()); return
+async def profile(u, ct):
+    uid = u.effective_user.id; clear(uid); r = user(u.effective_user)
+    await u.message.reply_text(
+        f'👤 Profile\n\n🆔 {r["tg_id"]}\n👤 {r["name"]}\n💰 ৳{r["balance"]:.2f}\n🎁 {r["ref"]}\n📅 {r["created_at"]}',
+        reply_markup=menu(uid)
+    )
+
+
+async def referral(u, ct):
+    uid = u.effective_user.id; clear(uid); r = user(u.effective_user)
+    me = await ct.bot.get_me()
+    c = conn()
+    try:
+        n = c.execute('SELECT COUNT(*) c FROM users WHERE referred_by=?', (uid,)).fetchone()['c']
+    finally:
+        c.close()
+    link = f'https://t.me/{me.username}?start=ref_{r["ref"]}'
+    await u.message.reply_text(
+        f'👥 Referral\n\n🎁 প্রতি Referral: ৳{float(setting("ref_reward", "2")):.2f}\n👥 Total: {n}\n\n🔗 {link}',
+        reply_markup=menu(uid)
+    )
+
+
+async def tasks(u, ct):
+    uid = u.effective_user.id; clear(uid)
+    c = conn()
+    try:
+        rows = c.execute('SELECT * FROM tasks WHERE active=1 ORDER BY id DESC').fetchall()
+    finally:
+        c.close()
+    if not rows:
+        await u.message.reply_text('📋 এখন কোনো Task নেই।', reply_markup=menu(uid)); return
+    await u.message.reply_text(f'📋 মোট {len(rows)}টি Task আছে।', reply_markup=menu(uid))
     for t in rows:
-        kb=InlineKeyboardMarkup([[InlineKeyboardButton('🗑 Delete',callback_data=f'tdel:{t["id"]}')]])
-        await u.message.reply_text(f'#{t["id"]} {t["title"]}\n💰 ৳{t["reward"]:.2f}\n🔗 {t["link"] or "-"}',reply_markup=kb)
+        buttons = []
+        if t['link']:
+            buttons.append(InlineKeyboardButton('🔗 Open Task', url=t['link']))
+        buttons.append(InlineKeyboardButton('📤 Submit Proof', callback_data=f'sub:{t["id"]}'))
+        await u.message.reply_text(
+            f'📌 #{t["id"]} {t["title"]}\n\n{t["description"]}\n\n💰 Reward: ৳{t["reward"]:.2f}',
+            reply_markup=InlineKeyboardMarkup([buttons])
+        )
 
-async def admin_list(u,ct,kind):
-    table={'sub':'submissions','dep':'deposits','with':'withdrawals'}[kind]; c=conn(); rows=c.execute(f'select * from {table} where status="pending" order by id desc limit 30').fetchall(); c.close()
-    if not rows: await u.message.reply_text('✅ কোনো Pending request নেই।',reply_markup=amenu()); return
-    for r in rows:
-        if kind=='sub':
-            txt=f'📥 Submission #{r["id"]}\nUser: {r["user_id"]}\nTask: #{r["task_id"]}\nReward: ৳{r["reward"]}\nProof: {r["proof"]}'; cb=f'sa:{r["id"]}'; rb=f'sr:{r["id"]}'
-        elif kind=='dep': txt=f'💳 Deposit #{r["id"]}\nUser: {r["user_id"]}\n{r["method"]}\n৳{r["amount"]}\nTrx: {r["trx"]}'; cb=f'da:{r["id"]}'; rb=f'dr:{r["id"]}'
-        else: txt=f'💸 Withdrawal #{r["id"]}\nUser: {r["user_id"]}\n{r["method"]}\n{r["number"]}\n৳{r["amount"]}'; cb=f'wa:{r["id"]}'; rb=f'wr:{r["id"]}'
-        await u.message.reply_text(txt,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('✅ Approve',callback_data=cb),InlineKeyboardButton('❌ Reject',callback_data=rb)]]))
 
-async def admin_settings(u,ct):
-    STATE[ADMIN]={'flow':'settings','step':1}
-    kb=ReplyKeyboardMarkup([['💳 bKash','💳 Nagad'],['🎁 Referral','💸 Min Withdraw'],['❌ Cancel']],resize_keyboard=True,is_persistent=True)
-    await u.message.reply_text(f'⚙️ Settings\n\nbKash: {setting("bkash")}\nNagad: {setting("nagad")}\nReferral: ৳{setting("ref_reward")}\nMinimum Withdraw: ৳{setting("min_withdraw") }\n\nযেটা পরিবর্তন করবেন সেটার বাটনে চাপুন।',reply_markup=kb)
-async def settings_flow(u,ct,s):
-    if s['step']==1:
-        keymap={'💳 bKash':'bkash','💳 Nagad':'nagad','🎁 Referral':'ref_reward','💸 Min Withdraw':'min_withdraw'}
-        key=keymap.get(u.message.text)
-        if not key:
-            await u.message.reply_text('নিচের একটি Settings বাটনে চাপুন।')
-            return
-        s['key']=key; s['step']=2; await u.message.reply_text('নতুন Value লিখুন:',reply_markup=cancel_menu())
+async def add_task_flow(u, ct, s):
+    uid = u.effective_user.id; text = (u.message.text or '').strip(); step = s['step']; d = s['data']
+    if step == 1:
+        d['title'] = text; s['step'] = 2
+        await u.message.reply_text('Task Description লিখুন:', reply_markup=cancel_menu())
+    elif step == 2:
+        d['description'] = text; s['step'] = 3
+        await u.message.reply_text('Reward কত টাকা? শুধু সংখ্যা লিখুন:', reply_markup=cancel_menu())
+    elif step == 3:
+        try:
+            reward = float(text)
+            if reward <= 0: raise ValueError
+            d['reward'] = reward; s['step'] = 4
+            await u.message.reply_text('Task Link দিন (না থাকলে - লিখুন):', reply_markup=cancel_menu())
+        except ValueError:
+            await u.message.reply_text('❌ Reward শুধু সংখ্যা হবে। যেমন 10', reply_markup=cancel_menu())
     else:
-        set_setting(s['key'],u.message.text); clear(ADMIN); await u.message.reply_text('✅ Setting Updated.',reply_markup=amenu())
+        link = '' if text == '-' else text
+        c = conn()
+        try:
+            c.execute('INSERT INTO tasks(title,description,reward,link,created_at) VALUES(?,?,?,?,?)',
+                      (d['title'], d['description'], d['reward'], link, now()))
+            c.commit()
+        finally:
+            c.close()
+        clear(uid)
+        await u.message.reply_text('✅ Task Added!', reply_markup=amenu())
 
-async def admin_users(u,ct):
-    c=conn(); n=c.execute('select count(*) c from users').fetchone()['c']; rows=c.execute('select tg_id,name,balance from users order by id desc limit 20').fetchall(); c.close(); txt=f'👥 Total Users: {n}\n\n'+'\n'.join(f'{r["tg_id"]} | {r["name"]} | ৳{r["balance"]:.2f}' for r in rows); await u.message.reply_text(txt,reply_markup=amenu())
 
-async def admin_broadcast(u,ct):
-    clear(u.effective_user.id)
-    STATE[u.effective_user.id]={'flow':'broadcast'}
-    await u.message.reply_text('📢 যে মেসেজটি সব User-এর কাছে পাঠাতে চান, সেটি লিখুন।\n\n❌ Cancel করতে Cancel চাপুন।',reply_markup=cancel_menu())
+async def begin_submit(q, uid, tid):
+    STATE[uid] = {'flow': 'submit', 'task': tid}
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton('✅ Done', callback_data=f'done:{tid}')],
+        [InlineKeyboardButton('❌ Cancel', callback_data='scancel')]
+    ])
+    await q.message.reply_text('📋 Task শেষ করে নিচের Done বাটনে চাপুন।\n\nআলাদা Proof লিখতে হবে না।', reply_markup=kb)
 
-async def do_broadcast(u,ct):
-    uid=u.effective_user.id
-    msg=(u.message.text or '').strip()
+
+async def submit_done(u, ct, tid):
+    uid = u.effective_user.id
+    s = STATE.get(uid)
+    if not s or s.get('flow') != 'submit' or s.get('task') != tid:
+        s = {'flow': 'submit', 'task': tid}
+    c = conn()
+    try:
+        t = c.execute('SELECT * FROM tasks WHERE id=? AND active=1', (tid,)).fetchone()
+        if not t:
+            clear(uid); await u.callback_query.message.reply_text('❌ Task পাওয়া যায়নি।', reply_markup=menu(uid)); return
+        old = c.execute('SELECT id FROM submissions WHERE user_id=? AND task_id=? AND status="pending"', (uid, tid)).fetchone()
+        if old:
+            clear(uid); await u.callback_query.message.reply_text('⏳ এই Task-এর submission already pending.', reply_markup=menu(uid)); return
+        c.execute('INSERT INTO submissions(user_id,task_id,proof,reward,status,created_at) VALUES(?,?,?,?,?,?)',
+                  (uid, tid, 'Done', t['reward'], 'pending', now()))
+        sid = c.lastrowid
+        c.commit()
+    finally:
+        c.close()
+    clear(uid)
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton('✅ Approve', callback_data=f'sa:{sid}'), InlineKeyboardButton('❌ Reject', callback_data=f'sr:{sid}')]])
+    admin_text = f'📥 New Task Submission\n\n🆔 Submission: {sid}\n👤 User: {uid}\n📌 Task: #{tid} {t["title"]}\n💰 Reward: ৳{t["reward"]:.2f}\n\n📝 Proof: Done'
+    sent = await safe_admin_message(ct, admin_text, kb)
+    if sent:
+        msg = '✅ Submission Admin-এর কাছে পাঠানো হয়েছে। Approval-এর জন্য অপেক্ষা করুন।'
+    else:
+        msg = '⚠️ Submission সংরক্ষণ হয়েছে। Admin-এর কাছে সরাসরি পাঠানো যায়নি; Admin Menu → 📥 Submissions থেকে Pending request দেখা যাবে।'
+    await u.callback_query.message.reply_text(msg, reply_markup=menu(uid))
+
+
+async def deposit_flow(u, ct, s):
+    uid = u.effective_user.id; text = (u.message.text or '').strip(); step = s['step']; d = s['data']
+    if step == 1:
+        if text not in ('bKash', 'Nagad'):
+            await u.message.reply_text('নিচের bKash অথবা Nagad বাটনে চাপুন।', reply_markup=method_menu()); return
+        d['method'] = text; s['step'] = 2
+        await u.message.reply_text(f'💳 {text} Number: {setting(text.lower())}\n\nকত টাকা Deposit করবেন?', reply_markup=cancel_menu())
+    elif step == 2:
+        try:
+            amount = float(text)
+            if amount <= 0: raise ValueError
+            d['amount'] = amount; s['step'] = 3
+            await u.message.reply_text('Transaction ID (TrxID) লিখুন:', reply_markup=cancel_menu())
+        except ValueError:
+            await u.message.reply_text('❌ সঠিক Amount দিন।', reply_markup=cancel_menu())
+    else:
+        trx = text
+        c = conn()
+        try:
+            c.execute('INSERT INTO deposits(user_id,method,amount,trx,status,created_at) VALUES(?,?,?,?,?,?)',
+                      (uid, d['method'], d['amount'], trx, 'pending', now()))
+            did = c.lastrowid; c.commit()
+        finally:
+            c.close()
+        clear(uid)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton('✅ Approve', callback_data=f'da:{did}'), InlineKeyboardButton('❌ Reject', callback_data=f'dr:{did}')]])
+        admin_text = f'💳 New Deposit\n\nID: {did}\nUser: {uid}\nMethod: {d["method"]}\nAmount: ৳{d["amount"]:.2f}\nTrxID: {trx}'
+        sent = await safe_admin_message(ct, admin_text, kb)
+        if sent:
+            msg = '✅ Deposit request পাঠানো হয়েছে। Approval-এর জন্য অপেক্ষা করুন।'
+        else:
+            msg = '⚠️ Deposit request সংরক্ষণ হয়েছে। Admin Menu → 💳 Deposits থেকে Pending request দেখা যাবে।'
+        await u.message.reply_text(msg, reply_markup=menu(uid))
+
+
+async def withdraw_flow(u, ct, s):
+    uid = u.effective_user.id; text = (u.message.text or '').strip(); step = s['step']; d = s['data']
+    if step == 1:
+        if text not in ('bKash', 'Nagad'):
+            await u.message.reply_text('নিচের bKash অথবা Nagad বাটনে চাপুন।', reply_markup=method_menu()); return
+        d['method'] = text; s['step'] = 2
+        await u.message.reply_text(f'{text} Number লিখুন:', reply_markup=cancel_menu())
+    elif step == 2:
+        d['number'] = text; s['step'] = 3
+        await u.message.reply_text(f'Minimum Withdraw: ৳{setting("min_withdraw", "50")}\n\nAmount লিখুন:', reply_markup=cancel_menu())
+    else:
+        try:
+            amount = float(text); minimum = float(setting('min_withdraw', '50'))
+            if amount < minimum: raise ValueError('minimum')
+            if amount <= 0: raise ValueError
+        except ValueError as e:
+            if str(e) == 'minimum':
+                await u.message.reply_text(f'❌ Minimum Withdraw ৳{minimum:.2f}', reply_markup=cancel_menu())
+            else:
+                await u.message.reply_text('❌ সঠিক Amount দিন।', reply_markup=cancel_menu())
+            return
+        c = conn()
+        try:
+            r = c.execute('SELECT balance FROM users WHERE tg_id=?', (uid,)).fetchone()
+            if not r or r['balance'] < amount:
+                await u.message.reply_text('❌ আপনার Balance যথেষ্ট নয়।', reply_markup=cancel_menu()); return
+            c.execute('UPDATE users SET balance=balance-? WHERE tg_id=?', (amount, uid))
+            c.execute('INSERT INTO withdrawals(user_id,method,number,amount,status,created_at) VALUES(?,?,?,?,?,?)',
+                      (uid, d['method'], d['number'], amount, 'pending', now()))
+            wid = c.lastrowid; c.commit()
+        finally:
+            c.close()
+        clear(uid)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton('✅ Approve', callback_data=f'wa:{wid}'), InlineKeyboardButton('❌ Reject', callback_data=f'wr:{wid}')]])
+        admin_text = f'💸 New Withdrawal\n\nID: {wid}\nUser: {uid}\nMethod: {d["method"]}\nNumber: {d["number"]}\nAmount: ৳{amount:.2f}'
+        sent = await safe_admin_message(ct, admin_text, kb)
+        if sent:
+            msg = '✅ Withdrawal request পাঠানো হয়েছে। Approval-এর জন্য অপেক্ষা করুন।'
+        else:
+            msg = '⚠️ Withdrawal সংরক্ষণ হয়েছে। Admin Menu → 💸 Withdrawals থেকে Pending request দেখা যাবে।'
+        await u.message.reply_text(msg, reply_markup=menu(uid))
+
+
+async def history(u, ct):
+    uid = u.effective_user.id; clear(uid); c = conn()
+    try:
+        a = c.execute('SELECT * FROM submissions WHERE user_id=? ORDER BY id DESC LIMIT 10', (uid,)).fetchall()
+        d = c.execute('SELECT * FROM deposits WHERE user_id=? ORDER BY id DESC LIMIT 10', (uid,)).fetchall()
+        w = c.execute('SELECT * FROM withdrawals WHERE user_id=? ORDER BY id DESC LIMIT 10', (uid,)).fetchall()
+    finally: c.close()
+    out = '📜 History\n\n📋 Submissions:\n' + ('\n'.join(f'#{x["id"]} Task#{x["task_id"]} — {x["status"]} — ৳{x["reward"]:.2f}' for x in a) or 'None')
+    out += '\n\n💳 Deposits:\n' + ('\n'.join(f'#{x["id"]} {x["method"]} ৳{x["amount"]:.2f} — {x["status"]}' for x in d) or 'None')
+    out += '\n\n💸 Withdrawals:\n' + ('\n'.join(f'#{x["id"]} {x["method"]} ৳{x["amount"]:.2f} — {x["status"]}' for x in w) or 'None')
+    await u.message.reply_text(out, reply_markup=menu(uid))
+
+
+async def admin_menu(u, ct):
+    if u.effective_user.id != ADMIN:
+        await u.message.reply_text('❌ Access Denied'); return
+    clear(ADMIN); STATE[ADMIN] = {'flow':'adminpass'}
+    await u.message.reply_text('🔐 Admin Password লিখুন:', reply_markup=cancel_menu())
+
+
+async def admin_manage(u, ct):
+    c = conn()
+    try: rows = c.execute('SELECT * FROM tasks ORDER BY id DESC').fetchall()
+    finally: c.close()
+    if not rows:
+        await u.message.reply_text('📋 কোনো Task নেই।', reply_markup=amenu()); return
+    for t in rows:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton('🗑 Delete', callback_data=f'tdel:{t["id"]}')]])
+        await u.message.reply_text(f'#{t["id"]} {t["title"]}\n💰 ৳{t["reward"]:.2f}\n🔗 {t["link"] or "-"}', reply_markup=kb)
+
+
+async def admin_list(u, ct, kind):
+    table = {'sub':'submissions', 'dep':'deposits', 'with':'withdrawals'}[kind]
+    c = conn()
+    try: rows = c.execute(f'SELECT * FROM {table} WHERE status="pending" ORDER BY id DESC LIMIT 50').fetchall()
+    finally: c.close()
+    if not rows:
+        await u.message.reply_text('✅ কোনো Pending request নেই।', reply_markup=amenu()); return
+    for r in rows:
+        if kind == 'sub':
+            txt = f'📥 Submission #{r["id"]}\nUser: {r["user_id"]}\nTask: #{r["task_id"]}\nReward: ৳{r["reward"]:.2f}\nProof: {r["proof"]}'
+            cb, rb = f'sa:{r["id"]}', f'sr:{r["id"]}'
+        elif kind == 'dep':
+            txt = f'💳 Deposit #{r["id"]}\nUser: {r["user_id"]}\n{r["method"]}\n৳{r["amount"]:.2f}\nTrxID: {r["trx"]}'
+            cb, rb = f'da:{r["id"]}', f'dr:{r["id"]}'
+        else:
+            txt = f'💸 Withdrawal #{r["id"]}\nUser: {r["user_id"]}\n{r["method"]}\n{r["number"]}\n৳{r["amount"]:.2f}'
+            cb, rb = f'wa:{r["id"]}', f'wr:{r["id"]}'
+        await u.message.reply_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('✅ Approve', callback_data=cb), InlineKeyboardButton('❌ Reject', callback_data=rb)]]))
+
+
+async def admin_settings(u, ct):
+    STATE[ADMIN] = {'flow':'settings', 'step':1}
+    kb = ReplyKeyboardMarkup([['💳 bKash','💳 Nagad'],['🎁 Referral','💸 Min Withdraw'],['❌ Cancel']], resize_keyboard=True, is_persistent=True)
+    await u.message.reply_text(
+        f'⚙️ Settings\n\nbKash: {setting("bkash")}\nNagad: {setting("nagad")}\nReferral: ৳{setting("ref_reward")}\nMinimum Withdraw: ৳{setting("min_withdraw")}\n\nযেটা পরিবর্তন করবেন সেটার বাটনে চাপুন।', reply_markup=kb)
+
+
+async def settings_flow(u, ct, s):
+    if s['step'] == 1:
+        key = {'💳 bKash':'bkash','💳 Nagad':'nagad','🎁 Referral':'ref_reward','💸 Min Withdraw':'min_withdraw'}.get(u.message.text)
+        if not key:
+            await u.message.reply_text('নিচের একটি Settings বাটনে চাপুন।'); return
+        s['key'] = key; s['step'] = 2
+        await u.message.reply_text('নতুন Value লিখুন:', reply_markup=cancel_menu())
+    else:
+        set_setting(s['key'], u.message.text.strip()); clear(ADMIN)
+        await u.message.reply_text('✅ Setting Updated.', reply_markup=amenu())
+
+
+async def admin_users(u, ct):
+    c = conn()
+    try:
+        n = c.execute('SELECT COUNT(*) c FROM users').fetchone()['c']
+        rows = c.execute('SELECT tg_id,name,balance FROM users ORDER BY id DESC LIMIT 30').fetchall()
+    finally: c.close()
+    txt = f'👥 Total Users: {n}\n\n' + ('\n'.join(f'{r["tg_id"]} | {r["name"]} | ৳{r["balance"]:.2f}' for r in rows) or 'None')
+    await u.message.reply_text(txt, reply_markup=amenu())
+
+
+async def admin_broadcast(u, ct):
+    clear(ADMIN); STATE[ADMIN] = {'flow':'broadcast'}
+    await u.message.reply_text('📢 যে মেসেজটি সব User-এর কাছে পাঠাতে চান সেটি লিখুন।', reply_markup=cancel_menu())
+
+
+async def do_broadcast(u, ct):
+    msg = (u.message.text or '').strip()
     if not msg:
-        await u.message.reply_text('❌ খালি মেসেজ পাঠানো যাবে না।',reply_markup=cancel_menu())
-        return
-    c=conn(); rows=c.execute('select tg_id from users').fetchall(); c.close()
-    sent=0; failed=0
+        await u.message.reply_text('❌ খালি মেসেজ পাঠানো যাবে না।', reply_markup=cancel_menu()); return
+    c = conn()
+    try: rows = c.execute('SELECT tg_id FROM users').fetchall()
+    finally: c.close()
+    sent = failed = 0
     await u.message.reply_text(f'📢 Broadcast শুরু হয়েছে...\n👥 মোট User: {len(rows)}')
     for r in rows:
         try:
-            await ct.bot.send_message(r['tg_id'], f'📢 *Admin Message*\n\n{msg}', parse_mode='Markdown')
-            sent += 1
+            await asyncio.wait_for(ct.bot.send_message(r['tg_id'], f'📢 Admin Message\n\n{msg}'), 10); sent += 1
         except Exception as e:
-            failed += 1
-            print('BROADCAST ERROR:', r['tg_id'], e)
+            failed += 1; print('BROADCAST ERROR:', r['tg_id'], repr(e))
         await asyncio.sleep(0.05)
-    clear(uid)
-    await u.message.reply_text(f'✅ Broadcast শেষ।\n\n📤 সফলভাবে গেছে: {sent}\n⚠️ পাঠানো যায়নি: {failed}',reply_markup=amenu())
+    clear(ADMIN)
+    await u.message.reply_text(f'✅ Broadcast শেষ।\n\n📤 গেছে: {sent}\n⚠️ যায়নি: {failed}', reply_markup=amenu())
 
-async def callback(u,ct):
-    q=u.callback_query; await q.answer(); uid=q.from_user.id; data=q.data
-    if data.startswith('sub:'):
-        tid=int(data.split(':')[1]); STATE[uid]={'flow':'submit','task':tid}
-        kb=InlineKeyboardMarkup([[InlineKeyboardButton('✅ Done',callback_data=f'done:{tid}')],[InlineKeyboardButton('❌ Cancel',callback_data='scancel')]])
-        await q.message.reply_text('📤 Task শেষ হলে নিচের Done বাটনে চাপুন।',reply_markup=kb); return
-    if data == 'scancel':
-        clear(uid); await q.message.reply_text('❌ Cancel করা হয়েছে।',reply_markup=menu(uid)); return
-    if data.startswith('done:'):
-        tid=int(data.split(':')[1])
-        s=STATE.get(uid)
-        if not s or s.get('flow')!='submit' or s.get('task')!=tid:
-            STATE[uid]={'flow':'submit','task':tid}
-            s=STATE[uid]
-        await submit_flow(u,ct,s,proof='Done')
-        return
-    if uid!=ADMIN: return
-    action,id_=data.split(':'); rid=int(id_); c=conn()
+
+async def process_admin_action(q, ct, action, rid):
+    c = conn(); target = None; msg = None
     try:
-        c.execute('begin immediate')
+        c.execute('BEGIN IMMEDIATE')
         if action in ('sa','sr'):
-            r=c.execute('select * from submissions where id=? and status="pending"',(rid,)).fetchone()
+            r = c.execute('SELECT * FROM submissions WHERE id=? AND status="pending"', (rid,)).fetchone()
             if not r: raise ValueError('already')
-            status='approved' if action=='sa' else 'rejected'; c.execute('update submissions set status=?,reviewed_at=? where id=?',(status,now(),rid))
-            if action=='sa': c.execute('update users set balance=balance+? where tg_id=?',(r['reward'],r['user_id']))
-            msg=('✅ Task Approved!\n💰 Reward +৳%.2f'%r['reward']) if action=='sa' else '❌ Task Submission Rejected.'
+            approved = action == 'sa'
+            c.execute('UPDATE submissions SET status=?,reviewed_at=? WHERE id=?', ('approved' if approved else 'rejected', now(), rid))
+            if approved: c.execute('UPDATE users SET balance=balance+? WHERE tg_id=?', (r['reward'], r['user_id']))
+            msg = f'✅ Task Approved!\n💰 Reward +৳{r["reward"]:.2f}' if approved else '❌ Task Submission Rejected.'
+            target = r['user_id']
         elif action in ('da','dr'):
-            r=c.execute('select * from deposits where id=? and status="pending"',(rid,)).fetchone()
+            r = c.execute('SELECT * FROM deposits WHERE id=? AND status="pending"', (rid,)).fetchone()
             if not r: raise ValueError('already')
-            status='approved' if action=='da' else 'rejected'; c.execute('update deposits set status=?,reviewed_at=? where id=?',(status,now(),rid))
-            if action=='da': c.execute('update users set balance=balance+? where tg_id=?',(r['amount'],r['user_id']))
-            msg=('✅ Deposit Approved!\n💰 +৳%.2f'%r['amount']) if action=='da' else '❌ Deposit Rejected.'
+            approved = action == 'da'
+            c.execute('UPDATE deposits SET status=?,reviewed_at=? WHERE id=?', ('approved' if approved else 'rejected', now(), rid))
+            if approved: c.execute('UPDATE users SET balance=balance+? WHERE tg_id=?', (r['amount'], r['user_id']))
+            msg = f'✅ Deposit Approved!\n💰 +৳{r["amount"]:.2f}' if approved else '❌ Deposit Rejected.'
+            target = r['user_id']
         elif action in ('wa','wr'):
-            r=c.execute('select * from withdrawals where id=? and status="pending"',(rid,)).fetchone()
+            r = c.execute('SELECT * FROM withdrawals WHERE id=? AND status="pending"', (rid,)).fetchone()
             if not r: raise ValueError('already')
-            status='approved' if action=='wa' else 'rejected'; c.execute('update withdrawals set status=?,reviewed_at=? where id=?',(status,now(),rid))
-            if action=='wr': c.execute('update users set balance=balance+? where tg_id=?',(r['amount'],r['user_id']))
-            msg='✅ Withdrawal Approved.' if action=='wa' else '❌ Withdrawal Rejected.\n💰 Amount refunded to your Balance.'
-        elif action=='tdel':
-            c.execute('update tasks set active=0 where id=?',(rid,)); c.commit(); c.close(); await q.message.reply_text('🗑 Task deleted.'); return
-        else: raise ValueError('bad')
-        c.execute('insert into notifications(user_id,message,created_at) values(?,?,?)',(r['user_id'],msg,now())); c.commit(); target=r['user_id']
+            approved = action == 'wa'
+            c.execute('UPDATE withdrawals SET status=?,reviewed_at=? WHERE id=?', ('approved' if approved else 'rejected', now(), rid))
+            if not approved: c.execute('UPDATE users SET balance=balance+? WHERE tg_id=?', (r['amount'], r['user_id']))
+            msg = '✅ Withdrawal Approved.' if approved else f'❌ Withdrawal Rejected.\n💰 ৳{r["amount"]:.2f} Balance-এ ফেরত দেওয়া হয়েছে।'
+            target = r['user_id']
+        elif action == 'tdel':
+            c.execute('UPDATE tasks SET active=0 WHERE id=?', (rid,)); c.commit()
+            await q.message.reply_text('🗑 Task deleted.', reply_markup=amenu()); return
+        else:
+            raise ValueError('bad')
+        c.execute('INSERT INTO notifications(user_id,message,created_at) VALUES(?,?,?)', (target, msg, now()))
+        c.commit()
     except ValueError:
-        c.rollback(); c.close(); await q.message.reply_text('⚠️ এই Request ইতিমধ্যে processed হয়েছে।'); return
-    c.close(); await q.message.reply_text('✅ Done.')
-    try: await ct.bot.send_message(target,msg)
-    except: pass
+        c.rollback(); await q.message.reply_text('⚠️ এই Request ইতিমধ্যে processed হয়েছে।'); return
+    except Exception as e:
+        c.rollback(); print('ADMIN ACTION ERROR:', repr(e)); await q.message.reply_text('❌ Action সম্পন্ন হয়নি। Render Logs দেখুন।'); return
+    finally:
+        c.close()
+    await q.message.reply_text('✅ Done.', reply_markup=amenu())
+    await notify_user(ct, target, msg)
 
-async def text(u,ct):
-    uid=u.effective_user.id; t=u.message.text.strip()
-    if t=='❌ Cancel':
-        clear(uid)
-        await u.message.reply_text('❌ Cancel করা হয়েছে।',reply_markup=amenu() if uid==ADMIN else menu(uid))
-        return
-    if t=='💰 Balance': return await balance(u,ct)
-    if t=='🏠 Home': return await home(u,ct)
-    if t=='📋 Tasks': return await tasks(u,ct)
-    if t=='👤 Profile': return await profile(u,ct)
-    if t=='👥 Referral': return await referral(u,ct)
-    if t=='📜 History': return await history(u,ct)
-    if t=='💳 Deposit': STATE[uid]={'flow':'deposit','step':1,'data':{}}; await u.message.reply_text('Deposit Method নির্বাচন করুন:',reply_markup=method_menu()); return
-    if t=='💸 Withdraw': STATE[uid]={'flow':'withdraw','step':1,'data':{}}; await u.message.reply_text('Withdraw Method নির্বাচন করুন:',reply_markup=method_menu()); return
-    if t=='🔐 Admin': return await admin_menu(u,ct)
-    if uid==ADMIN:
-        if t=='➕ Add Task': STATE[uid]={'flow':'add','step':1,'data':{}}; await u.message.reply_text('Task Name লিখুন:',reply_markup=cancel_menu()); return
-        if t=='📋 Manage Tasks': return await admin_manage(u,ct)
-        if t=='📥 Submissions': return await admin_list(u,ct,'sub')
-        if t=='💳 Deposits': return await admin_list(u,ct,'dep')
-        if t=='💸 Withdrawals': return await admin_list(u,ct,'with')
-        if t=='⚙️ Settings': return await admin_settings(u,ct)
-        if t=='📢 Broadcast': return await admin_broadcast(u,ct)
-        if t=='👥 Users': return await admin_users(u,ct)
-    s=STATE.get(uid)
-    if s:
-        if s['flow']=='adminpass':
-            if uid==ADMIN and t==PASSWORD: clear(uid); await u.message.reply_text('✅ Admin Login Successful',reply_markup=amenu())
-            else: await u.message.reply_text('❌ Password ভুল।')
-        elif s['flow']=='add': await add_task_flow(u,ct,s)
-        elif s['flow']=='submit': await submit_flow(u,ct,s)
-        elif s['flow']=='deposit': await deposit_flow(u,ct,s)
-        elif s['flow']=='withdraw': await withdraw_flow(u,ct,s)
-        elif s['flow']=='settings': await settings_flow(u,ct,s)
-        elif s['flow']=='broadcast' and uid==ADMIN: await do_broadcast(u,ct)
-        return
-    await u.message.reply_text('Menu থেকে Option নির্বাচন করুন।',reply_markup=menu(uid))
 
-async def err(u,ct): print('ERROR:',ct.error)
+async def callback(u, ct):
+    q = u.callback_query
+    await q.answer()
+    uid = q.from_user.id; data = q.data or ''
+    try:
+        if data.startswith('sub:'):
+            await begin_submit(q, uid, int(data.split(':',1)[1])); return
+        if data == 'scancel':
+            clear(uid); await q.message.reply_text('❌ Cancel করা হয়েছে।', reply_markup=menu(uid)); return
+        if data.startswith('done:'):
+            await submit_done(u, ct, int(data.split(':',1)[1])); return
+        if uid != ADMIN: return
+        action, rid = data.split(':', 1)
+        await process_admin_action(q, ct, action, int(rid))
+    except Exception as e:
+        print('CALLBACK ERROR:', repr(e))
+        try: await q.message.reply_text('❌ এই কাজটি সম্পন্ন হয়নি। আবার চেষ্টা করুন।')
+        except Exception: pass
+
+
+async def text(u, ct):
+    uid = u.effective_user.id; t = (u.message.text or '').strip()
+    try:
+        if t == '❌ Cancel':
+            clear(uid); await u.message.reply_text('❌ Cancel করা হয়েছে।', reply_markup=amenu() if uid == ADMIN and STATE.get(uid, {}).get('admin_view') else menu(uid)); return
+        if t == '💰 Balance': return await balance(u, ct)
+        if t == '📋 Tasks': return await tasks(u, ct)
+        if t == '👤 Profile': return await profile(u, ct)
+        if t == '👥 Referral': return await referral(u, ct)
+        if t == '📜 History': return await history(u, ct)
+        if t == '💳 Deposit':
+            STATE[uid] = {'flow':'deposit','step':1,'data':{}}
+            await u.message.reply_text('Deposit Method নির্বাচন করুন:', reply_markup=method_menu()); return
+        if t == '💸 Withdraw':
+            STATE[uid] = {'flow':'withdraw','step':1,'data':{}}
+            await u.message.reply_text('Withdraw Method নির্বাচন করুন:', reply_markup=method_menu()); return
+        if t == '🔐 Admin': return await admin_menu(u, ct)
+        if t == '🏠 User Menu':
+            clear(uid); await u.message.reply_text('👤 User Menu', reply_markup=menu(uid)); return
+        if uid == ADMIN:
+            if t == '➕ Add Task': STATE[uid] = {'flow':'add','step':1,'data':{}}; await u.message.reply_text('Task Name লিখুন:', reply_markup=cancel_menu()); return
+            if t == '📋 Manage Tasks': return await admin_manage(u, ct)
+            if t == '📥 Submissions': return await admin_list(u, ct, 'sub')
+            if t == '💳 Deposits': return await admin_list(u, ct, 'dep')
+            if t == '💸 Withdrawals': return await admin_list(u, ct, 'with')
+            if t == '⚙️ Settings': return await admin_settings(u, ct)
+            if t == '📢 Broadcast': return await admin_broadcast(u, ct)
+            if t == '👥 Users': return await admin_users(u, ct)
+        s = STATE.get(uid)
+        if s:
+            if s['flow'] == 'adminpass':
+                if uid == ADMIN and t == PASSWORD:
+                    clear(uid); STATE[uid] = {'admin_view': True}; await u.message.reply_text('✅ Admin Login Successful', reply_markup=amenu())
+                else: await u.message.reply_text('❌ Password ভুল।')
+            elif s['flow'] == 'add': await add_task_flow(u, ct, s)
+            elif s['flow'] == 'deposit': await deposit_flow(u, ct, s)
+            elif s['flow'] == 'withdraw': await withdraw_flow(u, ct, s)
+            elif s['flow'] == 'settings': await settings_flow(u, ct, s)
+            elif s['flow'] == 'broadcast' and uid == ADMIN: await do_broadcast(u, ct)
+            return
+        await u.message.reply_text('Menu থেকে Option নির্বাচন করুন।', reply_markup=menu(uid))
+    except Exception as e:
+        print('TEXT ERROR:', repr(e))
+        await u.message.reply_text('❌ একটি সমস্যা হয়েছে। আবার চেষ্টা করুন।', reply_markup=menu(uid))
+
+
+async def err(u, ct):
+    print('BOT ERROR:', repr(ct.error))
+
 
 def start_health_server():
-    # Render Web Services require an HTTP port to stay available.
-    # This tiny standard-library server avoids adding another package.
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    port=int(os.getenv('PORT','10000'))
-
+    port = int(os.getenv('PORT', '10000'))
     class HealthHandler(BaseHTTPRequestHandler):
         def do_GET(self):
-            body=b'Limon BD Earning Bot is running'
-            self.send_response(200)
-            self.send_header('Content-Type','text/plain; charset=utf-8')
-            self.send_header('Content-Length',str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        def log_message(self, format, *args):
-            return
-
-    server=ThreadingHTTPServer(('0.0.0.0',port),HealthHandler)
+            body = b'Limon BD Earning Bot is running'
+            self.send_response(200); self.send_header('Content-Type','text/plain; charset=utf-8'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
+        def log_message(self, fmt, *args): return
+    server = ThreadingHTTPServer(('0.0.0.0', port), HealthHandler)
     print(f'Health server listening on 0.0.0.0:{port}')
     server.serve_forever()
 
+
 def main():
     init()
-    import threading
-    threading.Thread(target=start_health_server,daemon=True).start()
-    app=Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler('start',start))
+    threading.Thread(target=start_health_server, daemon=True).start()
+    app = Application.builder().token(TOKEN).connect_timeout(10).read_timeout(20).write_timeout(20).pool_timeout(10).build()
+    app.add_handler(CommandHandler('start', start))
     app.add_handler(CallbackQueryHandler(callback))
-    app.add_handler(MessageHandler(filters.PHOTO,photo_proof))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text))
     app.add_error_handler(err)
     print('Limon BD Earning Bot চলছে...')
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-if __name__=='__main__': main()
+
+if __name__ == '__main__':
+    main()
