@@ -155,6 +155,7 @@ def user(tg):
 
 def menu(uid):
     rows = [
+        ["▶️ START"],
         ["💰 Balance", "📋 Tasks"],
         ["💳 Deposit", "💸 Withdraw"],
         ["👥 Referral", "📜 History"],
@@ -372,11 +373,9 @@ async def begin_submit(q, uid, tid):
 
 async def submit_done(q, ct, tid):
     uid = q.from_user.id
-    state = STATE.get(uid)
-    if not state or state.get("flow") != "submit" or state.get("task") != tid:
-        clear(uid)
-        await q.message.reply_text("❌ Submit session পাওয়া যায়নি। আবার Tasks থেকে চেষ্টা করুন।", reply_markup=menu(uid))
-        return
+    # Do not depend on in-memory STATE here. A Render restart/reconnect between
+    # Submit Proof and Done must not prevent the submission from being saved.
+    # The task id in the button is sufficient to validate the request.
 
     c = conn()
     try:
@@ -802,6 +801,8 @@ async def text(u, ct):
             await u.message.reply_text("❌ Cancel করা হয়েছে।", reply_markup=amenu() if uid == ADMIN else menu(uid))
             return
 
+        if text_value == "▶️ START":
+            await start(u, ct); return
         if text_value == "💰 Balance":
             await balance(u, ct); return
         if text_value == "📋 Tasks":
