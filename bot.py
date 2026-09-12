@@ -65,6 +65,41 @@ def init():
             "ref_reward": "2",
             "min_withdraw": "50",
         }
+        # Migrate old databases safely: add any columns required by the current bot.
+        migrations = {
+            "users": {
+                "balance": "REAL DEFAULT 0", "ref": "TEXT", "referred_by": "INTEGER", "ref_paid": "INTEGER DEFAULT 0", "created_at": "TEXT", "username": "TEXT", "name": "TEXT"
+            },
+            "tasks": {
+                "title": "TEXT", "description": "TEXT", "reward": "REAL DEFAULT 0", "link": "TEXT", "active": "INTEGER DEFAULT 1", "created_at": "TEXT"
+            },
+            "submissions": {
+                "user_id": "INTEGER", "task_id": "INTEGER", "proof": "TEXT", "reward": "REAL DEFAULT 0", "status": "TEXT DEFAULT 'pending'", "created_at": "TEXT", "reviewed_at": "TEXT"
+            },
+            "deposits": {
+                "user_id": "INTEGER", "method": "TEXT", "amount": "REAL DEFAULT 0", "trx": "TEXT", "status": "TEXT DEFAULT 'pending'", "created_at": "TEXT", "reviewed_at": "TEXT"
+            },
+            "withdrawals": {
+                "user_id": "INTEGER", "method": "TEXT", "number": "TEXT", "amount": "REAL DEFAULT 0", "status": "TEXT DEFAULT 'pending'", "created_at": "TEXT", "reviewed_at": "TEXT"
+            },
+            "notifications": {
+                "user_id": "INTEGER", "message": "TEXT", "created_at": "TEXT", "is_read": "INTEGER DEFAULT 0"
+            },
+        }
+        for table, cols in migrations.items():
+            existing = {r[1] for r in q(f"PRAGMA table_info({table})").fetchall()}
+            for col, definition in cols.items():
+                if col not in existing:
+                    q(f"ALTER TABLE {table} ADD COLUMN {col} {definition}")
+
+        # Fill safe defaults in migrated rows.
+        q("UPDATE users SET balance=0 WHERE balance IS NULL")
+        q("UPDATE users SET ref_paid=0 WHERE ref_paid IS NULL")
+        q("UPDATE tasks SET active=1 WHERE active IS NULL")
+        q("UPDATE submissions SET status='pending' WHERE status IS NULL OR status=''")
+        q("UPDATE deposits SET status='pending' WHERE status IS NULL OR status=''")
+        q("UPDATE withdrawals SET status='pending' WHERE status IS NULL OR status=''")
+
         for key, value in defaults.items():
             q("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, value))
         c.commit()
